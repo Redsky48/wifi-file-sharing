@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFi Share</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="login-view" class="login hidden">
+        <div class="login-card">
+            <h1 class="login-title">WiFi Share</h1>
+            <p class="login-subtitle">Enter PIN</p>
+            <div id="pin-dots" class="pin-dots">
+                <span class="pin-dot"></span>
+                <span class="pin-dot"></span>
+                <span class="pin-dot"></span>
+                <span class="pin-dot"></span>
+                <span class="pin-dot"></span>
+                <span class="pin-dot"></span>
+            </div>
+            <p id="login-error" class="login-error hidden">Wrong PIN</p>
+            <div class="keypad">
+                <button class="key" data-digit="1">1</button>
+                <button class="key" data-digit="2">2</button>
+                <button class="key" data-digit="3">3</button>
+                <button class="key" data-digit="4">4</button>
+                <button class="key" data-digit="5">5</button>
+                <button class="key" data-digit="6">6</button>
+                <button class="key" data-digit="7">7</button>
+                <button class="key" data-digit="8">8</button>
+                <button class="key" data-digit="9">9</button>
+                <span class="key-empty"></span>
+                <button class="key" data-digit="0">0</button>
+                <button class="key key-back" id="pin-back" aria-label="Backspace">⌫</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="app-view" class="hidden">
+    <header>
+        <h1>WiFi Share</h1>
+        <button id="refresh" class="ghost" title="Refresh">&#x21bb;</button>
+    </header>
+
+    <main>
+        <section id="dropzone" class="dropzone">
+            <div class="dropzone-inner">
+                <div class="dropzone-icon">&#x2B06;</div>
+                <p><strong>Drop files here</strong> or
+                    <label class="link" for="file-input">browse</label>
+                </p>
+                <input id="file-input" type="file" multiple hidden>
+            </div>
+            <div id="upload-list" class="upload-list"></div>
+        </section>
+
+        <section class="files">
+            <nav id="breadcrumb" class="breadcrumb"></nav>
+            <ul id="files-list" class="files-list"></ul>
+            <div id="files-empty" class="empty hidden">This folder is empty.</div>
+        </section>
+
+        <div id="preview-overlay" class="preview-overlay hidden">
+            <div class="preview-frame" role="dialog" aria-modal="true">
+                <header class="preview-header">
+                    <span id="preview-name" class="preview-name"></span>
+                    <div class="preview-actions">
+                        <a id="preview-download" class="preview-btn" download>Download</a>
+                        <button id="preview-close" class="preview-close" aria-label="Close">&times;</button>
+                    </div>
+                </header>
+                <div id="preview-content" class="preview-content"></div>
+            </div>
+        </div>
+
+        <section class="windows-app">
+            <div class="windows-app-header">
+                <div>
+                    <h2>Mount as a Windows drive</h2>
+                    <p class="muted">
+                        Get a real <code>Z:\</code> drive in File Explorer instead of using this browser.
+                    </p>
+                </div>
+                <a class="primary-btn" href="/download/WiFiShareTray.exe" download>
+                    Download for Windows
+                </a>
+            </div>
+
+            <details class="howto" open>
+                <summary>How it works <span class="muted">(read once)</span></summary>
+                <div class="howto-body">
+                    <ol>
+                        <li>
+                            On your <strong>Windows PC</strong> (same WiFi as your phone) run
+                            <code>WiFiShareTray.exe</code>. A small circle icon appears in
+                            the system tray.
+                        </li>
+                        <li>
+                            The app finds your phone automatically over mDNS and mounts
+                            the shared folder as a network drive (usually <code>Z:\</code>).
+                            Open File Explorer — your phone's files are there.
+                        </li>
+                        <li>
+                            <strong>Copy / drag / open / delete</strong> files like a normal
+                            USB stick. Both directions.
+                        </li>
+                        <li>
+                            When the phone disconnects (turns off, leaves WiFi, server stopped),
+                            the drive auto-unmounts and the tray icon goes gray. Reconnect
+                            and it auto-mounts again.
+                        </li>
+                    </ol>
+
+                    <h3>Requirements</h3>
+                    <ul class="req">
+                        <li>Windows 10 / 11</li>
+                        <li>
+                            <strong>.NET 8 Desktop Runtime</strong>. If the .exe says it's
+                            missing, install it once from
+                            <a href="https://dotnet.microsoft.com/download/dotnet/8.0/runtime" target="_blank" rel="noopener">microsoft.com/download/dotnet/8.0</a>
+                            (pick "Desktop Runtime", x64).
+                        </li>
+                        <li>
+                            Same WiFi network as your phone (no firewall blocking UDP 5353
+                            for mDNS). Click <em>Allow</em> if Windows Defender prompts.
+                        </li>
+                    </ul>
+
+                    <h3>If the drive doesn't appear</h3>
+                    <ul class="req">
+                        <li>
+                            The tray icon's right-click menu lets you pick the device manually
+                            and re-trigger mount.
+                        </li>
+                        <li>
+                            Open <kbd>cmd</kbd> and run <code>net start WebClient</code> —
+                            Windows needs the WebClient service running for WebDAV mounts.
+                        </li>
+                        <li>
+                            For files larger than 50 MB, raise the registry limit:
+                            <code>HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters\FileSizeLimitInBytes</code>
+                            → set to <code>0xFFFFFFFF</code> and reboot.
+                        </li>
+                    </ul>
+
+                    <p class="muted small">
+                        Under the hood: the phone speaks WebDAV at
+                        <code>http://&lt;phone&gt;/dav</code> and Windows mounts it via
+                        <code>net use</code>. The tray app only adds discovery, the
+                        watchdog, and a clean unmount.
+                    </p>
+                </div>
+            </details>
+        </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    </div><!-- /#app-view -->
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

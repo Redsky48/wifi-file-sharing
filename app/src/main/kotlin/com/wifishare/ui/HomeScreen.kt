@@ -1,0 +1,259 @@
+package com.wifishare.ui
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import com.wifishare.server.Clients
+import com.wifishare.server.ServerService
+import com.wifishare.util.WifiMonitor
+
+@Composable
+fun HomeScreen(
+    viewModel: MainViewModel,
+    onOpenSettings: () -> Unit,
+    onOpenFiles: () -> Unit,
+) {
+    val settings by viewModel.settings.collectAsState()
+    val serverState by viewModel.serverState.collectAsState()
+    val wifiState by viewModel.wifiState.collectAsState()
+    val clients by viewModel.clients.collectAsState()
+
+    val wifiConnected = wifiState is WifiMonitor.State.Connected
+
+    val scroll = rememberScrollState()
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .verticalScroll(scroll)
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        StatusCard(serverState)
+
+        if (!wifiConnected) {
+            WarningCard(
+                title = "Not connected to WiFi",
+                body = "The server only runs over WiFi. Connect to a WiFi network, then tap Start.",
+            )
+        }
+
+        if (settings.folderUri == null) {
+            WarningCard(
+                title = "Folder not set",
+                body = "Pick a download folder in Settings before starting the server.",
+            )
+        } else {
+            InfoRow("Folder", settings.folderDisplay.ifBlank { "(picked)" })
+            InfoRow("Port", settings.port.toString())
+            InfoRow("Uploads", if (settings.allowUploads) "Allowed" else "Read-only")
+            InfoRow("Delete", if (settings.allowDelete) "Allowed" else "Disabled")
+        }
+
+        if (serverState is ServerService.State.Running) {
+            ConnectedClientsCard(clients)
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            val running = serverState is ServerService.State.Running
+            val canStart = settings.folderUri != null && wifiConnected
+            Button(
+                onClick = {
+                    if (running) viewModel.stopServer() else viewModel.startServer()
+                },
+                enabled = canStart || running,
+                modifier = Modifier.weight(1f),
+                colors = if (running) ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error
+                ) else ButtonDefaults.buttonColors(),
+            ) {
+                Icon(
+                    if (running) Icons.Default.Stop else Icons.Default.PlayArrow,
+                    contentDescription = null,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(if (running) "Stop" else "Start")
+            }
+        }
+
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            OutlinedButton(
+                onClick = onOpenFiles,
+                modifier = Modifier.weight(1f),
+                enabled = settings.folderUri != null,
+            ) {
+                Text("Browse files")
+            }
+            OutlinedButton(onClick = onOpenSettings, modifier = Modifier.weight(1f)) {
+                Text("Settings")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConnectedClientsCard(clients: List<Clients.Client>) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("Connected", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "${clients.size}",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            if (clients.isEmpty()) {
+                Text(
+                    "No clients yet. Open the URL on your PC.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                clients.forEach { client ->
+                    ClientRow(client)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ClientRow(client: Clients.Client) {
+    val ageMs = System.currentTimeMillis() - client.lastSeen
+    val agoText = when {
+        ageMs < 30_000 -> "now"
+        ageMs < 60_000 -> "${ageMs / 1000}s ago"
+        ageMs < 3_600_000 -> "${ageMs / 60_000}m ago"
+        else -> "${ageMs / 3_600_000}h ago"
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Row {
+                Text(client.name, fontWeight = FontWeight.Medium)
+                if (client.registered) {
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "✓",
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            Text(
+                "${client.address}  ·  $agoText" +
+                    if (client.transfers > 0) "  ·  ${client.transfers} transfers" else "",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun WarningCard(title: String, body: String) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer
+        ),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(4.dp))
+            Text(body, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+private fun StatusCard(state: ServerService.State) {
+    val (label, body, color) = when (state) {
+        is ServerService.State.Running -> Triple(
+            "Running",
+            state.url,
+            MaterialTheme.colorScheme.primary,
+        )
+        is ServerService.State.Stopped -> Triple(
+            "Stopped",
+            "Tap Start to share",
+            MaterialTheme.colorScheme.outline,
+        )
+        is ServerService.State.Error -> Triple(
+            "Error",
+            state.message,
+            MaterialTheme.colorScheme.error,
+        )
+    }
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = color.copy(alpha = 0.12f)),
+    ) {
+        Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(label, style = MaterialTheme.typography.labelLarge, color = color)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                body,
+                style = MaterialTheme.typography.headlineSmall,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (state is ServerService.State.Running) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Open this URL on PC in the same WiFi",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, fontWeight = FontWeight.Medium)
+    }
+}

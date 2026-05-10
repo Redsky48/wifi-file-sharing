@@ -1,0 +1,20 @@
+*.iml
+.gradle/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.keystore
+release/
+
+# IDE files
+.vscode/
+*.swp
+
+# Gradle wrapper jar (download via `gradle wrapper`)
+!gradle/wrapper/gradle-wrapper.jar

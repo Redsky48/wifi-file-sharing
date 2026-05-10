@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(winget search gradle --disable-interactivity 2>&1)"
+    ]
+  }
+}

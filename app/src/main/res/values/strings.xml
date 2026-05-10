@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WiFi Share</string>
+    <string name="channel_server">File Server</string>
+    <string name="channel_transfers">File Transfers</string>
+    <string name="notification_running">Sharing files at %1$s</string>
+    <string name="notification_uploaded">Received: %1$s</string>
+    <string name="notification_downloaded">Sent: %1$s</string>
+    <string name="share_target_label">WiFi Share</string>
+</resources>
