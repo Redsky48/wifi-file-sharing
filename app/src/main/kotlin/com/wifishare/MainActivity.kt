@@ -28,6 +28,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import com.wifishare.ui.AdBanner
 import com.wifishare.ui.FilesScreen
 import com.wifishare.ui.HomeScreen
 import com.wifishare.ui.MainViewModel
@@ -95,6 +96,9 @@ private fun AppScaffold(viewModel: MainViewModel) {
                     }
                 },
             )
+        },
+        bottomBar = {
+            AdBanner()
         },
     ) { padding ->
         Box(Modifier.padding(padding)) {

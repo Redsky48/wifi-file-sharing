@@ -15,6 +15,25 @@ android {
         versionCode = 5
         versionName = "0.5.0"
         resourceConfigurations += listOf("en")
+
+        // ---- AdMob configuration ----
+        // Leave both empty to ship without ads. To enable:
+        //   1. Create an AdMob app + banner ad-unit at https://admob.google.com
+        //      (your AdSense publisher ID auto-links into AdMob).
+        //   2. Paste the IDs below.
+        //   3. The app initialises MobileAds and shows a banner only when
+        //      ADMOB_BANNER_UNIT_ID is non-empty — otherwise the SDK is left
+        //      idle and the bottom bar disappears.
+        val admobAppId = ""              // e.g. "ca-app-pub-1608660333482788~1234567890"
+        val admobBannerUnitId = ""       // e.g. "ca-app-pub-1608660333482788/0987654321"
+
+        // Manifest needs *some* APPLICATION_ID even when ads are disabled,
+        // otherwise the Play Services bootstrap crashes on init. We feed
+        // Google's official test ID as a harmless placeholder.
+        manifestPlaceholders["admobAppId"] = admobAppId.ifBlank {
+            "ca-app-pub-3940256099942544~3347511713"
+        }
+        buildConfigField("String", "ADMOB_BANNER_UNIT_ID", "\"$admobBannerUnitId\"")
     }
 
     buildTypes {
@@ -83,4 +102,7 @@ dependencies {
 
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    // Google Mobile Ads (AdMob). Bundles Play Services dependency.
+    implementation("com.google.android.gms:play-services-ads:23.6.0")
 }

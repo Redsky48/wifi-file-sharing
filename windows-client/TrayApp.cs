@@ -31,8 +31,10 @@ public sealed class TrayApp : IDisposable
     private readonly Mounter _mounter = new();
     private readonly HealthChecker _health = new();
     private readonly QueuePoller _queue;
+    private readonly IpcServer _ipc = new();
     private readonly SynchronizationContext _ui;
     private readonly ToolStripMenuItem _settingsItem;
+    private readonly ToolStripMenuItem _sendToItem;
 
     private AppState _state = AppState.Scanning;
     private DiscoveredService? _connectedTo;
@@ -74,6 +76,26 @@ public sealed class TrayApp : IDisposable
         };
         _settingsItem = new ToolStripMenuItem("Settings…", null, (_, _) => OpenSettings());
 
+        _sendToItem = new ToolStripMenuItem("Send To: WiFi Share")
+        {
+            CheckOnClick = true,
+            Checked = SendToShortcut.IsRegistered,
+        };
+        _sendToItem.CheckedChanged += (_, _) =>
+        {
+            try
+            {
+                if (_sendToItem.Checked) SendToShortcut.Register();
+                else SendToShortcut.Unregister();
+            }
+            catch (Exception ex)
+            {
+                ShowBalloon("Send To toggle failed", ex.Message);
+                // Reflect the actual on-disk state
+                _sendToItem.Checked = SendToShortcut.IsRegistered;
+            }
+        };
+
         _installItem = new ToolStripMenuItem("Install on this PC", null, (_, _) => DoInstall())
         {
             Visible = !Installer.IsInstalled,
@@ -112,6 +134,7 @@ public sealed class TrayApp : IDisposable
             new ToolStripSeparator(),
             _autoConnectItem,
             _autoStartItem,
+            _sendToItem,
             _settingsItem,
             new ToolStripSeparator(),
             _installItem,
@@ -136,7 +159,102 @@ public sealed class TrayApp : IDisposable
 
         _health.Lost += OnPhoneVanished;
 
+        // IPC: secondary launches (Send To) hand off their file paths
+        // here so we can upload them via the connection this tray owns.
+        _ipc.PathsReceived += paths => Post(() => QueueUploads(paths));
+        _ipc.Start();
+
         Application.ApplicationExit += (_, _) => Cleanup();
+    }
+
+    /// <summary>
+    /// Upload one or more local files. If multiple phones are visible the
+    /// user is asked which one; if only one is found we send there
+    /// directly. The chosen phone's saved PIN is used (or the user is
+    /// prompted, exactly like the mount flow).
+    /// </summary>
+    public void QueueUploads(string[] paths)
+    {
+        if (paths.Length == 0) return;
+
+        var devices = _browser.Snapshot().ToList();
+        if (devices.Count == 0)
+        {
+            ShowBalloon("No phones found",
+                "Wait for the phone to appear on the LAN, then try again.");
+            return;
+        }
+
+        DiscoveredService? target;
+        if (devices.Count == 1)
+        {
+            target = devices[0];
+        }
+        else
+        {
+            using var dlg = new SendTargetDialog(devices, _connectedTo, paths);
+            if (dlg.ShowDialog() != DialogResult.OK) return;
+            target = dlg.SelectedDevice;
+            if (target == null) return;
+        }
+
+        SendToTargetAsync(target, paths);
+    }
+
+    private void SendToTargetAsync(DiscoveredService target, string[] paths)
+    {
+        var deviceLabel = TrimName(target.Name);
+        var password = _settings.GetPassword(target.Name);
+
+        // If the phone requires PIN and we don't have one saved → ask.
+        if (target.AuthRequired && string.IsNullOrEmpty(password))
+        {
+            var entered = AskPassword(deviceLabel, wrongPassword: false);
+            if (entered == null) return;
+            password = entered;
+            _settings.SavePassword(target.Name, password);
+        }
+
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            int ok = 0, fail = 0;
+            string? lastError = null;
+            foreach (var path in paths)
+            {
+                var outcome = await Uploader.UploadAsync(target.Url, password, path);
+                if (outcome.Success) ok++;
+                else { fail++; lastError = outcome.Error; }
+            }
+            Post(() =>
+            {
+                if (fail == 0)
+                {
+                    ShowBalloon(
+                        $"Sent to {deviceLabel}",
+                        ok == 1 ? Path.GetFileName(paths[0]) : $"{ok} file(s) sent");
+                }
+                else if (lastError != null && lastError.Contains("401"))
+                {
+                    // PIN was rejected — prompt and retry once.
+                    Post(() =>
+                    {
+                        var fresh = AskPassword(deviceLabel, wrongPassword: true);
+                        if (fresh != null)
+                        {
+                            _settings.SavePassword(target.Name, fresh);
+                            // Re-enqueue with the fresh PIN
+                            SendToTargetAsync(target, paths);
+                        }
+                    });
+                }
+                else
+                {
+                    ShowBalloon(
+                        $"Send failed ({fail}/{paths.Length})",
+                        lastError ?? "unknown error");
+                }
+            });
+        });
     }
 
     private void OnDeviceFound(DiscoveredService svc)
@@ -539,6 +657,8 @@ public sealed class TrayApp : IDisposable
     private void Cleanup()
     {
         try { _health.Stop(); } catch { }
+        try { _queue.Stop(); } catch { }
+        try { _ipc.Stop(); } catch { }
         try { _ = _mounter.UnmountAsync(); } catch { }
         try { _tray.Visible = false; } catch { }
     }
@@ -548,6 +668,7 @@ public sealed class TrayApp : IDisposable
         Cleanup();
         _browser.Dispose();
         _health.Dispose();
+        _ipc.Dispose();
         _menu.Dispose();
         _tray.Dispose();
     }

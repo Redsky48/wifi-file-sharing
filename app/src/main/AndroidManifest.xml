@@ -23,6 +23,13 @@
         android:theme="@style/Theme.WiFiShare"
         tools:targetApi="34">
 
+        <!-- AdMob app ID — value comes from build.gradle.kts manifest
+             placeholder. Empty in build.gradle = test placeholder, so the
+             SDK boot doesn't crash even when ads are disabled. -->
+        <meta-data
+            android:name="com.google.android.gms.ads.APPLICATION_ID"
+            android:value="${admobAppId}" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
