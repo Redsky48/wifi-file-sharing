@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.PowerManager
 import android.provider.DocumentsContract
 import android.provider.Settings
@@ -101,6 +102,26 @@ fun SettingsScreen(viewModel: MainViewModel) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+
+        Section("Quick Settings tile") {
+            Text(
+                "Add WiFi Share to the pull-down Quick Settings panel for one-tap start/stop.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                Button(onClick = { requestAddQuickSettingsTile(context) }) {
+                    Text("Add to Quick Settings")
+                }
+            } else {
+                Text(
+                    "Pull down Quick Settings → Edit (pencil icon) → drag the WiFi Share tile up to add it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
         }
 
         Section("Background streaming") {
@@ -314,6 +335,21 @@ private fun isIgnoringBatteryOptimization(context: Context): Boolean {
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         pm.isIgnoringBatteryOptimizations(context.packageName)
     }.getOrDefault(false)
+}
+
+@SuppressLint("WrongConstant")
+private fun requestAddQuickSettingsTile(context: Context) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    runCatching {
+        val sbm = context.getSystemService(android.app.StatusBarManager::class.java) ?: return
+        sbm.requestAddTileService(
+            android.content.ComponentName(context, com.wifishare.WifiShareTileService::class.java),
+            "WiFi Share",
+            android.graphics.drawable.Icon.createWithResource(context, com.wifishare.R.drawable.ic_qs_tile),
+            { runnable -> runnable.run() },
+            { _ -> /* result code ignored — Android shows its own feedback */ },
+        )
+    }
 }
 
 @SuppressLint("BatteryLife")

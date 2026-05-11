@@ -35,6 +35,7 @@ public sealed class TrayApp : IDisposable
     private readonly SynchronizationContext _ui;
     private readonly ToolStripMenuItem _settingsItem;
     private readonly ToolStripMenuItem _sendToItem;
+    private readonly ToolStripMenuItem _shareTargetItem;
 
     private AppState _state = AppState.Scanning;
     private DiscoveredService? _connectedTo;
@@ -96,6 +97,20 @@ public sealed class TrayApp : IDisposable
             }
         };
 
+        _shareTargetItem = new ToolStripMenuItem("Show in Windows Share (Win+H)…")
+        {
+            CheckOnClick = false,
+        };
+        _shareTargetItem.Click += (_, _) => ToggleShareTarget();
+        // Async probe — Get-AppxPackage takes a second, don't block startup.
+        _ = System.Threading.Tasks.Task.Run(() =>
+        {
+            var registered = WindowsShareTarget.IsRegistered;
+            Post(() => _shareTargetItem.Text = registered
+                ? "Remove from Windows Share"
+                : "Show in Windows Share (Win+H)…");
+        });
+
         _installItem = new ToolStripMenuItem("Install on this PC", null, (_, _) => DoInstall())
         {
             Visible = !Installer.IsInstalled,
@@ -135,6 +150,7 @@ public sealed class TrayApp : IDisposable
             _autoConnectItem,
             _autoStartItem,
             _sendToItem,
+            _shareTargetItem,
             _settingsItem,
             new ToolStripSeparator(),
             _installItem,
@@ -151,6 +167,17 @@ public sealed class TrayApp : IDisposable
             ContextMenuStrip = _menu,
         };
         _tray.DoubleClick += (_, _) => _mounter.OpenInExplorer();
+
+        // Clicking a tray notification runs whatever action the most-recent
+        // ShowBalloon() registered. Cleared on click + on close so a stale
+        // action doesn't fire after a different balloon shows up.
+        _tray.BalloonTipClicked += (_, _) =>
+        {
+            var action = _balloonClickAction;
+            _balloonClickAction = null;
+            try { action?.Invoke(); } catch { /* ignore */ }
+        };
+        _tray.BalloonTipClosed += (_, _) => _balloonClickAction = null;
 
         _browser = new MdnsBrowser();
         _browser.Found += OnDeviceFound;
@@ -231,7 +258,8 @@ public sealed class TrayApp : IDisposable
                 {
                     ShowBalloon(
                         $"Sent to {deviceLabel}",
-                        ok == 1 ? Path.GetFileName(paths[0]) : $"{ok} file(s) sent");
+                        ok == 1 ? Path.GetFileName(paths[0]) : $"{ok} file(s) sent",
+                        onClick: _mounter.CurrentDrive != null ? _mounter.OpenInExplorer : null);
                 }
                 else if (lastError != null && lastError.Contains("401"))
                 {
@@ -389,8 +417,10 @@ public sealed class TrayApp : IDisposable
         _queue.Start(svc.Url, savedPassword);
 
         var backendName = result.Kind == MountKind.WinFsp ? "WinFSP" : "WebDAV";
-        ShowBalloon("Connected",
-            $"Mounted as {result.DriveLetter}: ({label}) via {backendName}");
+        ShowBalloon(
+            "Connected",
+            $"Mounted as {result.DriveLetter}: ({label}) via {backendName}. Click to open.",
+            onClick: () => _mounter.OpenInExplorer());
     }
 
     private string? AskPassword(string deviceName, bool wrongPassword)
@@ -452,6 +482,64 @@ public sealed class TrayApp : IDisposable
     {
         using var dlg = new SettingsDialog(_settings);
         dlg.ShowDialog();
+    }
+
+    private void ToggleShareTarget()
+    {
+        // Probe synchronously here since the user just clicked
+        var isReg = WindowsShareTarget.IsRegistered;
+
+        if (isReg)
+        {
+            var ok = MessageBox.Show(
+                "Remove WiFi Share from the Windows Share dialog?",
+                "WiFi Share",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Question);
+            if (ok != DialogResult.OK) return;
+            var (success, msg) = WindowsShareTarget.Unregister();
+            if (success) ShowBalloon("Removed", "Windows Share entry cleared.");
+            else MessageBox.Show("Unregister failed:\n" + msg, "WiFi Share",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        else
+        {
+            // Pre-flight: Developer Mode must be on, otherwise sparse
+            // packages can't register and the script will throw.
+            if (!WindowsShareTarget.IsDeveloperModeEnabled())
+            {
+                var open = MessageBox.Show(
+                    "Developer Mode must be ON for this to work.\n\n" +
+                    "Open Windows Settings now? Toggle 'Developer Mode' to On, " +
+                    "then come back and click this menu item again.",
+                    "WiFi Share — Developer Mode required",
+                    MessageBoxButtons.OKCancel,
+                    MessageBoxIcon.Warning);
+                if (open == DialogResult.OK) WindowsShareTarget.OpenDeveloperSettings();
+                return;
+            }
+
+            var go = MessageBox.Show(
+                "Register WiFi Share in the Windows Share dialog (Win+H)?\n\n" +
+                "This will run a PowerShell script. The .exe stays where it is.",
+                "WiFi Share — Windows Share integration",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Information);
+            if (go != DialogResult.OK) return;
+
+            var (success, msg) = WindowsShareTarget.Register();
+            if (success)
+                ShowBalloon("Registered", "WiFi Share now appears in Windows Share dialog.");
+            else
+                MessageBox.Show("Register failed:\n" + msg, "WiFi Share",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+
+        // Refresh the menu label
+        var nowRegistered = WindowsShareTarget.IsRegistered;
+        _shareTargetItem.Text = nowRegistered
+            ? "Remove from Windows Share"
+            : "Show in Windows Share (Win+H)…";
     }
 
     private void OpenWebPage()
@@ -521,7 +609,8 @@ public sealed class TrayApp : IDisposable
         {
             ShowBalloon(
                 $"Received {file.Name}",
-                $"Saved to {Path.GetDirectoryName(file.Path)}");
+                $"Saved to {Path.GetDirectoryName(file.Path)}. Click to open.",
+                onClick: () => OpenReceivedFile(file.Path));
         });
     }
 
@@ -637,16 +726,46 @@ public sealed class TrayApp : IDisposable
         _disconnectItem.Enabled = _state == AppState.Connected;
     }
 
-    private void ShowBalloon(string title, string body)
+    private Action? _balloonClickAction;
+
+    private void ShowBalloon(string title, string body, Action? onClick = null)
     {
         try
         {
+            _balloonClickAction = onClick;
             _tray.BalloonTipTitle = title;
             _tray.BalloonTipText = body;
             _tray.BalloonTipIcon = ToolTipIcon.Info;
             _tray.ShowBalloonTip(3000);
         }
         catch { /* ignore */ }
+    }
+
+    private static void OpenReceivedFile(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return;
+        // 1st attempt: open with default app
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = path,
+                UseShellExecute = true,
+            });
+            return;
+        }
+        catch { /* fall through */ }
+        // Fallback: open containing folder with the file pre-selected
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = "/select,\"" + path + "\"",
+                UseShellExecute = true,
+            });
+        }
+        catch { /* give up */ }
     }
 
     private void Post(Action action)

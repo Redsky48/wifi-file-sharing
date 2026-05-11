@@ -7,6 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
     <RootNamespace>WiFiShareTray</RootNamespace>
     <AssemblyName>WiFiShareTray</AssemblyName>
     <Version>0.5.0</Version>
@@ -35,6 +36,21 @@
       <HintPath>lib\winfsp-msil.dll</HintPath>
       <Private>True</Private>
     </Reference>
+  </ItemGroup>
+
+  <!-- Embed sparse-package manifest + registration scripts inside the
+       .exe so the single-file APK bundle stays a single file. The tray
+       extracts them to %TEMP% on demand and runs from there. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Package\AppxManifest.xml">
+      <LogicalName>AppxManifest.xml</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="scripts\Register-ShareTarget.ps1">
+      <LogicalName>Register-ShareTarget.ps1</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="scripts\Unregister-ShareTarget.ps1">
+      <LogicalName>Unregister-ShareTarget.ps1</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
 </Project>
