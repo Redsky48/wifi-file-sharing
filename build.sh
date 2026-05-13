@@ -84,9 +84,13 @@ CURL_AUTH=()
 
 encode_path() { printf %s "$1" | sed 's/ /%20/g'; }
 
-# Probe — gives a fast clear error if the phone is offline / wrong PIN
+# Probe — gives a fast clear error if the phone is offline / wrong PIN.
+# `curl -w '%{http_code}'` writes the code (or "000" on connect failure)
+# to stdout regardless of exit status — no `|| echo` fallback needed,
+# adding one would duplicate "000" into "000000".
 HTTP=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
-    "${CURL_AUTH[@]}" "${PHONE_HOST}/api/files" 2>/dev/null || echo "000")
+    "${CURL_AUTH[@]}" "${PHONE_HOST}/api/files" 2>/dev/null) || true
+HTTP="${HTTP:-000}"
 case "$HTTP" in
     200) ;;
     401) echo "Phone needs a PIN — set PHONE_PIN=<pin>"; exit 1 ;;
