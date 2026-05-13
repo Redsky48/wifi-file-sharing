@@ -106,6 +106,7 @@ LIST_RESP=$(curl -sS "${CURL_AUTH[@]}" "${PHONE_HOST}/api/files?path=${LIST_PATH
 OLD_FILES=$(printf %s "$LIST_RESP" \
     | grep -oE '"name":"[^"]+\.(apk|exe)"' \
     | sed 's/"name":"//;s/"$//' \
+    | sort -u \
     || true)
 # Note: still match .exe so we clean up any WiFiShareTray.exe pushed by
 # earlier versions of this script. The .exe ships inside the APK assets
