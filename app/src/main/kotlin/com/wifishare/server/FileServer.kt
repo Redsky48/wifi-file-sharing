@@ -54,6 +54,9 @@ class FileServer(
             val isHtmlGet = path == "/" && session.method.name.equals("GET", true)
             val isPublic = isHtmlGet ||
                 path == "/favicon.ico" ||
+                path == "/docs" ||
+                path == "/api/health" ||
+                path == "/api/info" ||
                 path.startsWith("/static/") ||
                 path.startsWith("/download/")
 
@@ -62,6 +65,7 @@ class FileServer(
             }
 
             val isTransferRequest = path == "/api/upload" || path == "/api/download" ||
+                (path == "/api/files" && session.method.name.equals("PUT", true)) ||
                 (rawPath.startsWith("/dav/") &&
                     session.method.name in listOf("GET", "PUT", "POST"))
 
@@ -83,16 +87,29 @@ class FileServer(
 
             when {
                 path == "/" -> serveRoot(session)
+                path == "/docs" -> serveAsset("web/docs.html", "text/html; charset=utf-8")
                 rawPath == "/dav" || rawPath.startsWith("/dav/") -> webdav.handle(session)
                 path.startsWith("/static/") -> serveStatic(path.removePrefix("/static/"))
                 path == "/download/WiFiShareTray.exe" -> serveAppDownload()
-                path == "/api/files" -> listFiles(session)
+                path == "/api/files" -> when (session.method.name.uppercase()) {
+                    "PUT" -> putRawFile(session)
+                    else -> listFiles(session)
+                }
                 path == "/api/download" -> downloadFile(session)
                 path == "/api/upload" -> uploadFiles(session)
                 path == "/api/delete" -> deleteFile(session)
                 path == "/api/clients" -> listClients()
                 path == "/api/clients/register" -> registerClient(session, ip)
                 path.startsWith("/api/queue/") -> handleQueue(session, path)
+                path == "/api/health" -> json(Response.Status.OK, """{"status":"ok"}""")
+                path == "/api/info" -> infoEndpoint()
+                path == "/api/storage" -> storageEndpoint()
+                path == "/api/file" -> fileInfoEndpoint(session)
+                path == "/api/search" -> searchEndpoint(session)
+                path == "/api/mkdir" -> mkdirEndpoint(session)
+                path == "/api/move" -> moveEndpoint(session)
+                path == "/api/copy" -> copyEndpoint(session)
+                path == "/api/notify" -> notifyEndpoint(session)
                 else -> notFound()
             }
         } catch (t: Throwable) {
@@ -289,6 +306,75 @@ class FileServer(
         return json(Response.Status.OK, payload.toString())
     }
 
+    /**
+     * Streamed raw-body upload — the curl-friendly cousin of /api/upload.
+     *
+     *   curl -u user:PIN --upload-file foo.jpg \
+     *        "http://phone:8080/api/files?path=Inbox/foo.jpg"
+     *
+     * Body is the file content (no multipart wrapper). `path` query
+     * parameter is the destination, relative to the shared root. Folders
+     * along the path must already exist. Filename collisions trigger
+     * auto-rename (foo.jpg → foo (1).jpg) just like the web drag-drop.
+     */
+    private fun putRawFile(session: IHTTPSession): Response {
+        if (!config.allowUploads) return forbidden("Uploads disabled")
+
+        val pathParam = session.parameters["path"]?.firstOrNull()?.trim('/')
+            ?: return badRequest("path query parameter required")
+        val parts = pathParam.split('/').filter { it.isNotEmpty() && it != "." && it != ".." }
+        if (parts.isEmpty()) return badRequest("path must include a filename")
+
+        val root = root() ?: return error("Folder not accessible")
+        val parentParts = parts.dropLast(1)
+        val rawName = parts.last()
+        val parent = if (parentParts.isEmpty()) root
+            else navigateTo(root, parentParts.joinToString("/"))
+                ?: return notFound()
+        if (!parent.isDirectory) return badRequest("Parent is not a folder")
+
+        val safeName = sanitize(rawName)
+        val finalName = uniqueName(parent, safeName)
+        val mime = guessMime(finalName)
+        val target = parent.createFile(mime, finalName) ?: return error("Create failed")
+
+        val contentLength = session.headers["content-length"]?.toLongOrNull() ?: -1L
+        try {
+            context.contentResolver.openOutputStream(target.uri)?.use { output ->
+                val input = session.inputStream
+                val buffer = ByteArray(64 * 1024)
+                var written = 0L
+                while (true) {
+                    val toRead = if (contentLength >= 0) {
+                        if (written >= contentLength) break
+                        minOf(buffer.size.toLong(), contentLength - written).toInt()
+                    } else buffer.size
+                    val n = input.read(buffer, 0, toRead)
+                    if (n <= 0) break
+                    output.write(buffer, 0, n)
+                    written += n
+                }
+                output.flush()
+            } ?: run {
+                target.delete()
+                return error("Cannot open output")
+            }
+        } catch (e: IOException) {
+            target.delete()
+            return error("Write error: ${e.message}")
+        }
+
+        Transfers.emit(TransferEvent.Uploaded(finalName))
+
+        val savedPath = if (parentParts.isEmpty()) finalName
+            else parentParts.joinToString("/") + "/" + finalName
+        val payload = JSONObject()
+            .put("saved", finalName)
+            .put("path", savedPath)
+            .put("size", target.length())
+        return json(Response.Status.CREATED, payload.toString())
+    }
+
     private fun deleteFile(session: IHTTPSession): Response {
         if (!config.allowDelete) return forbidden("Delete disabled")
         val pathParam = session.parameters["path"]?.firstOrNull()
@@ -374,6 +460,224 @@ class FileServer(
         }
         return r
     }
+
+    // ---- Management API endpoints --------------------------------------
+
+    private fun infoEndpoint(): Response {
+        val payload = JSONObject().apply {
+            put("name", "WiFi Share")
+            put("version", com.wifishare.BuildConfig.VERSION_NAME)
+            put("device", android.os.Build.MODEL ?: "Android")
+            put("manufacturer", android.os.Build.MANUFACTURER ?: "")
+            put("sdk", android.os.Build.VERSION.SDK_INT)
+            put("authRequired", config.password.isNotEmpty())
+            put("allowUploads", config.allowUploads)
+            put("allowDelete", config.allowDelete)
+        }
+        return json(Response.Status.OK, payload.toString())
+    }
+
+    private fun storageEndpoint(): Response {
+        return try {
+            val path = android.os.Environment.getExternalStorageDirectory().absolutePath
+            val stat = android.os.StatFs(path)
+            val total = stat.blockCountLong * stat.blockSizeLong
+            val available = stat.availableBlocksLong * stat.blockSizeLong
+            val payload = JSONObject()
+                .put("total", total)
+                .put("used", total - available)
+                .put("available", available)
+            json(Response.Status.OK, payload.toString())
+        } catch (_: Throwable) {
+            error("Storage info unavailable")
+        }
+    }
+
+    private fun fileInfoEndpoint(session: IHTTPSession): Response {
+        val pathParam = session.parameters["path"]?.firstOrNull()
+            ?: return badRequest("path required")
+        val root = root() ?: return error("Folder not accessible")
+        val file = resolveFile(root, pathParam) ?: return notFound()
+        val payload = JSONObject().apply {
+            put("name", file.name ?: "?")
+            put("path", pathParam.trim('/'))
+            put("type", if (file.isDirectory) "folder" else "file")
+            put("modified", file.lastModified())
+            if (file.isFile) {
+                put("size", file.length())
+                put("mime", file.type ?: "application/octet-stream")
+            }
+        }
+        return json(Response.Status.OK, payload.toString())
+    }
+
+    private fun searchEndpoint(session: IHTTPSession): Response {
+        val query = session.parameters["q"]?.firstOrNull()?.lowercase()?.takeIf { it.isNotBlank() }
+            ?: return badRequest("q required")
+        val pathParam = session.parameters["path"]?.firstOrNull()?.trim('/').orEmpty()
+        val limit = session.parameters["limit"]?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 1000) ?: 200
+
+        val root = root() ?: return error("Folder not accessible")
+        val searchRoot = if (pathParam.isEmpty()) root
+            else navigateTo(root, pathParam) ?: return notFound()
+
+        val results = JSONArray()
+        var count = 0
+
+        fun walk(folder: DocumentFile, relative: String) {
+            if (count >= limit) return
+            folder.listFiles().forEach { f ->
+                if (count >= limit) return@forEach
+                val name = f.name ?: return@forEach
+                val relPath = if (relative.isEmpty()) name else "$relative/$name"
+                if (name.lowercase().contains(query)) {
+                    results.put(JSONObject().apply {
+                        put("name", name)
+                        put("path", relPath)
+                        put("type", if (f.isDirectory) "folder" else "file")
+                        put("modified", f.lastModified())
+                        if (f.isFile) {
+                            put("size", f.length())
+                            put("mime", f.type ?: "application/octet-stream")
+                        }
+                    })
+                    count++
+                }
+                if (f.isDirectory) walk(f, relPath)
+            }
+        }
+        walk(searchRoot, pathParam)
+
+        return json(Response.Status.OK, JSONObject()
+            .put("query", query)
+            .put("results", results)
+            .put("truncated", count >= limit)
+            .toString())
+    }
+
+    private fun mkdirEndpoint(session: IHTTPSession): Response {
+        if (session.method != Method.POST) return badRequest("POST required")
+        if (!config.allowUploads) return forbidden("Uploads disabled (needed for mkdir)")
+
+        val pathParam = session.parameters["path"]?.firstOrNull()?.trim('/')
+            ?: return badRequest("path required")
+        val parts = pathParam.split('/').filter { it.isNotEmpty() && it != "." && it != ".." }
+        if (parts.isEmpty()) return badRequest("path must be non-empty")
+
+        val root = root() ?: return error("Folder not accessible")
+        var current = root
+        for (part in parts) {
+            val safe = sanitize(part)
+            val existing = current.findFile(safe)
+            current = if (existing != null) {
+                if (!existing.isDirectory) return badRequest("'$safe' already exists as a file")
+                existing
+            } else {
+                current.createDirectory(safe) ?: return error("createDirectory failed")
+            }
+        }
+        return json(Response.Status.CREATED, JSONObject().put("path", parts.joinToString("/")).toString())
+    }
+
+    private fun moveEndpoint(session: IHTTPSession): Response {
+        if (session.method != Method.POST) return badRequest("POST required")
+        if (!config.allowUploads) return forbidden("Uploads disabled (needed for move)")
+
+        val from = session.parameters["from"]?.firstOrNull()?.trim('/')
+            ?: return badRequest("from required")
+        val to = session.parameters["to"]?.firstOrNull()?.trim('/')
+            ?: return badRequest("to required")
+
+        val fromParts = from.split('/').filter { it.isNotEmpty() }
+        val toParts = to.split('/').filter { it.isNotEmpty() }
+        if (fromParts.isEmpty() || toParts.isEmpty()) return badRequest("paths must be non-empty")
+
+        if (fromParts.dropLast(1) != toParts.dropLast(1)) {
+            return badRequest("Cross-folder move not supported; use /api/copy + /api/delete")
+        }
+
+        val root = root() ?: return error("Folder not accessible")
+        val src = resolveFile(root, from) ?: return notFound()
+        val newName = sanitize(toParts.last())
+        return if (src.renameTo(newName))
+            json(Response.Status.OK, JSONObject()
+                .put("path", (toParts.dropLast(1) + newName).joinToString("/"))
+                .toString())
+        else error("Rename failed")
+    }
+
+    private fun copyEndpoint(session: IHTTPSession): Response {
+        if (session.method != Method.POST) return badRequest("POST required")
+        if (!config.allowUploads) return forbidden("Uploads disabled (needed for copy)")
+
+        val from = session.parameters["from"]?.firstOrNull()?.trim('/')
+            ?: return badRequest("from required")
+        val to = session.parameters["to"]?.firstOrNull()?.trim('/')
+            ?: return badRequest("to required")
+
+        val root = root() ?: return error("Folder not accessible")
+        val src = resolveFile(root, from) ?: return notFound()
+        if (!src.isFile) return badRequest("Only file copies supported")
+
+        val toParts = to.split('/').filter { it.isNotEmpty() }
+        if (toParts.isEmpty()) return badRequest("to must include a filename")
+        val toName = toParts.last()
+        val toParentPath = toParts.dropLast(1).joinToString("/")
+        val toParent = if (toParentPath.isEmpty()) root
+            else navigateTo(root, toParentPath) ?: return notFound()
+
+        val safeName = sanitize(toName)
+        val finalName = uniqueName(toParent, safeName)
+        val mime = src.type ?: "application/octet-stream"
+        val target = toParent.createFile(mime, finalName) ?: return error("Create failed")
+
+        try {
+            context.contentResolver.openInputStream(src.uri)?.use { input ->
+                context.contentResolver.openOutputStream(target.uri)?.use { output ->
+                    input.copyTo(output)
+                }
+            } ?: run {
+                target.delete(); return error("Cannot open source")
+            }
+        } catch (e: IOException) {
+            target.delete()
+            return error("Copy failed: ${e.message}")
+        }
+
+        val savedPath = if (toParentPath.isEmpty()) finalName else "$toParentPath/$finalName"
+        return json(Response.Status.CREATED, JSONObject()
+            .put("saved", finalName)
+            .put("path", savedPath)
+            .put("size", target.length())
+            .toString())
+    }
+
+    private fun notifyEndpoint(session: IHTTPSession): Response {
+        if (session.method != Method.POST) return badRequest("POST required")
+
+        val files = HashMap<String, String>()
+        try { session.parseBody(files) } catch (_: Exception) { /* raw bodies handled below */ }
+        val body = files["postData"]
+            ?: files["content"]?.let { File(it).readText() }
+            ?: ""
+
+        val title: String
+        val text: String
+        try {
+            val obj = JSONObject(body)
+            title = obj.optString("title").ifBlank {
+                return badRequest("title required")
+            }
+            text = obj.optString("text", "")
+        } catch (_: Exception) {
+            return badRequest("Invalid JSON body — expected {\"title\":\"…\",\"text\":\"…\"}")
+        }
+
+        Notifications.emit(title, text)
+        return json(Response.Status.OK, JSONObject().put("sent", true).toString())
+    }
+
+    // ---- existing endpoints --------------------------------------------
 
     private fun listClients(): Response {
         Clients.prune()

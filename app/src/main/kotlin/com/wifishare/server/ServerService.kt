@@ -35,6 +35,8 @@ class ServerService : Service() {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var wifiWatchJob: Job? = null
     private var transfersWatchJob: Job? = null
+    private var queueWatchJob: Job? = null
+    private var notifyWatchJob: Job? = null
     private var mdns: MdnsAdvertiser? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -45,6 +47,9 @@ class ServerService : Service() {
         when (intent?.action) {
             ACTION_START -> handleStart(intent)
             ACTION_STOP -> handleStop()
+            ACTION_CANCEL_PENDING -> {
+                Queue.clearAll()
+            }
         }
         return START_NOT_STICKY
     }
@@ -108,6 +113,76 @@ class ServerService : Service() {
             Transfers.events.collect { event ->
                 postTransferNotification(event)
             }
+        }
+
+        queueWatchJob?.cancel()
+        queueWatchJob = scope.launch {
+            Queue.state.collect { items -> updatePendingNotification(items.size) }
+        }
+
+        notifyWatchJob?.cancel()
+        notifyWatchJob = scope.launch {
+            Notifications.events.collect { n -> postCustomNotification(n.title, n.body) }
+        }
+    }
+
+    private fun postCustomNotification(title: String, body: String) {
+        val tap = PendingIntent.getActivity(
+            this,
+            (title + body).hashCode(),
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notif = NotificationCompat.Builder(this, WifiShareApp.CHANNEL_TRANSFERS)
+            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentIntent(tap)
+            .setAutoCancel(true)
+            .build()
+        try {
+            NotificationManagerCompat.from(this).notify(nextTransferId(), notif)
+        } catch (_: SecurityException) {
+            // POST_NOTIFICATIONS denied
+        }
+    }
+
+    private fun updatePendingNotification(count: Int) {
+        val mgr = NotificationManagerCompat.from(this)
+        if (count == 0) {
+            mgr.cancel(PENDING_NOTIF_ID)
+            return
+        }
+        val tap = PendingIntent.getActivity(
+            this,
+            10,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val cancelAll = PendingIntent.getService(
+            this,
+            11,
+            Intent(this, ServerService::class.java).setAction(ACTION_CANCEL_PENDING),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notif = NotificationCompat.Builder(this, WifiShareApp.CHANNEL_TRANSFERS)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle(getString(R.string.notification_pending_title))
+            .setContentText(getString(R.string.notification_pending_text, count))
+            .setContentIntent(tap)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .addAction(0, "Cancel all", cancelAll)
+            .build()
+        try {
+            mgr.notify(PENDING_NOTIF_ID, notif)
+        } catch (_: SecurityException) {
+            // POST_NOTIFICATIONS denied
         }
     }
 
@@ -203,6 +278,13 @@ class ServerService : Service() {
         wifiWatchJob = null
         transfersWatchJob?.cancel()
         transfersWatchJob = null
+        queueWatchJob?.cancel()
+        queueWatchJob = null
+        notifyWatchJob?.cancel()
+        notifyWatchJob = null
+
+        // Drop the pending notification (queue won't be picked up after stop).
+        NotificationManagerCompat.from(this).cancel(PENDING_NOTIF_ID)
 
         // Send mDNS goodbye FIRST so connected clients see the service go
         // offline before their HTTP polls hit a closed socket. They get a
@@ -282,6 +364,8 @@ class ServerService : Service() {
     companion object {
         const val ACTION_START = "com.wifishare.START"
         const val ACTION_STOP = "com.wifishare.STOP"
+        const val ACTION_CANCEL_PENDING = "com.wifishare.CANCEL_PENDING"
+        private const val PENDING_NOTIF_ID = 43
         const val EXTRA_FOLDER_URI = "folder_uri"
         const val EXTRA_PORT = "port"
         const val EXTRA_ALLOW_UPLOADS = "allow_uploads"

@@ -7,4 +7,6 @@
     <string name="notification_uploaded">Received: %1$s</string>
     <string name="notification_downloaded">Sent: %1$s</string>
     <string name="share_target_label">WiFi Share</string>
+    <string name="notification_pending_title">Pending — waiting for PC</string>
+    <string name="notification_pending_text">%1$d file(s) queued. Tap to manage.</string>
 </resources>

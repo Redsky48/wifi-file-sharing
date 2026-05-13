@@ -81,6 +81,18 @@ android {
     androidResources {
         noCompress += listOf("exe")
     }
+
+    // Recognisable APK filenames that embed both versionName and versionCode
+    // so the build.sh push-to-phone step can wipe older builds of the same
+    // variant by prefix match.
+    applicationVariants.all {
+        val variant = this
+        outputs.all {
+            val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
+            output.outputFileName =
+                "WiFiShare-${variant.versionName}-${variant.buildType.name}-v${variant.versionCode}.apk"
+        }
+    }
 }
 
 dependencies {

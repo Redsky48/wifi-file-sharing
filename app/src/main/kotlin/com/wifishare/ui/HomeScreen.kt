@@ -21,6 +21,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -43,6 +44,7 @@ fun HomeScreen(
     val serverState by viewModel.serverState.collectAsState()
     val wifiState by viewModel.wifiState.collectAsState()
     val clients by viewModel.clients.collectAsState()
+    val pending by viewModel.pendingQueue.collectAsState()
 
     val wifiConnected = wifiState is WifiMonitor.State.Connected
 
@@ -77,6 +79,15 @@ fun HomeScreen(
 
         if (serverState is ServerService.State.Running) {
             ConnectedClientsCard(clients)
+        }
+
+        if (pending.isNotEmpty()) {
+            PendingQueueCard(
+                pending = pending,
+                clients = clients,
+                onCancel = viewModel::cancelPending,
+                onCancelAll = viewModel::cancelAllPending,
+            )
         }
 
         Spacer(Modifier.height(8.dp))
@@ -122,6 +133,86 @@ fun HomeScreen(
             }
         }
     }
+}
+
+@Composable
+private fun PendingQueueCard(
+    pending: List<com.wifishare.server.Queue.Item>,
+    clients: List<Clients.Client>,
+    onCancel: (String) -> Unit,
+    onCancelAll: () -> Unit,
+) {
+    val byClient = pending.groupBy { it.clientId }
+    val clientName: (String) -> String = { id ->
+        clients.firstOrNull { it.clientId == id }?.name ?: "PC (offline)"
+    }
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+        ),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Pending — waiting for PC", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "${pending.size}",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            byClient.forEach { (clientId, items) ->
+                Text(
+                    "${clientName(clientId)} — ${items.size} file${if (items.size == 1) "" else "s"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                items.forEach { item ->
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(item.name, maxLines = 1)
+                            Text(
+                                formatBytes(item.size),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        TextButton(onClick = { onCancel(item.id) }) {
+                            Text("Cancel")
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+            }
+            if (pending.size > 1) {
+                Spacer(Modifier.height(4.dp))
+                Button(
+                    onClick = onCancelAll,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) {
+                    Text("Cancel all (${pending.size})")
+                }
+            }
+        }
+    }
+}
+
+private fun formatBytes(b: Long): String = when {
+    b < 1024 -> "$b B"
+    b < 1024L * 1024 -> "${b / 1024} KB"
+    b < 1024L * 1024 * 1024 -> "${b / 1024 / 1024} MB"
+    else -> String.format("%.1f GB", b / 1024.0 / 1024.0 / 1024.0)
 }
 
 @Composable

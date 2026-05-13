@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.wifishare.data.AppSettings
 import com.wifishare.data.SettingsRepository
 import com.wifishare.server.Clients
+import com.wifishare.server.Queue
 import com.wifishare.server.ServerService
 import com.wifishare.server.Transfers
 import com.wifishare.util.WifiMonitor
@@ -46,6 +47,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val serverState = ServerService.state
     val wifiState = WifiMonitor.state
     val clients = Clients.state
+    val pendingQueue = Queue.state
+
+    fun cancelPending(itemId: String) {
+        Queue.cancel(itemId)
+    }
+
+    fun cancelAllPending() {
+        Queue.clearAll()
+    }
 
     private val refreshTrigger = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
 

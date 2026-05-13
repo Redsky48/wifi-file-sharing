@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(winget search gradle --disable-interactivity 2>&1)"
+      "PowerShell(winget search gradle --disable-interactivity 2>&1)",
+      "Read(//c/Users/edza/Desktop/git/**)"
     ]
   }
 }

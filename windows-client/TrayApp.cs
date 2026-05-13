@@ -14,6 +14,8 @@ public sealed class TrayApp : IDisposable
     private readonly ContextMenuStrip _menu;
     private readonly ToolStripMenuItem _statusItem;
     private readonly ToolStripMenuItem _backendItem;
+    private readonly ToolStripMenuItem _pendingMenu;
+    private readonly ToolStripSeparator _pendingSeparator;
     private readonly ToolStripMenuItem _devicesHeader;
     private readonly ToolStripSeparator _devicesSeparator;
     private readonly ToolStripMenuItem _openItem;
@@ -32,6 +34,7 @@ public sealed class TrayApp : IDisposable
     private readonly HealthChecker _health = new();
     private readonly QueuePoller _queue;
     private readonly IpcServer _ipc = new();
+    private readonly PendingUploads _pending = new();
     private readonly SynchronizationContext _ui;
     private readonly ToolStripMenuItem _settingsItem;
     private readonly ToolStripMenuItem _sendToItem;
@@ -50,6 +53,8 @@ public sealed class TrayApp : IDisposable
 
         _statusItem = new ToolStripMenuItem("Scanning…") { Enabled = false };
         _backendItem = new ToolStripMenuItem(BackendStatusText()) { Enabled = false };
+        _pendingMenu = new ToolStripMenuItem("Pending: 0") { Visible = false };
+        _pendingSeparator = new ToolStripSeparator { Visible = false };
         _devicesHeader = new ToolStripMenuItem("Devices") { Enabled = false };
         _devicesSeparator = new ToolStripSeparator();
         _openItem = new ToolStripMenuItem("Open in Explorer", null, (_, _) => _mounter.OpenInExplorer())
@@ -140,6 +145,8 @@ public sealed class TrayApp : IDisposable
         {
             _statusItem,
             _backendItem,
+            _pendingMenu,
+            _pendingSeparator,
             new ToolStripSeparator(),
             _devicesHeader,
             _devicesSeparator,
@@ -191,7 +198,67 @@ public sealed class TrayApp : IDisposable
         _ipc.PathsReceived += paths => Post(() => QueueUploads(paths));
         _ipc.Start();
 
+        _pending.Changed += () => Post(RebuildPendingMenu);
+        RebuildPendingMenu();
+
         Application.ApplicationExit += (_, _) => Cleanup();
+    }
+
+    private void RebuildPendingMenu()
+    {
+        var items = _pending.Snapshot();
+        _pendingMenu.DropDownItems.Clear();
+        if (items.Count == 0)
+        {
+            _pendingMenu.Visible = false;
+            _pendingSeparator.Visible = false;
+            return;
+        }
+
+        _pendingMenu.Visible = true;
+        _pendingSeparator.Visible = true;
+        _pendingMenu.Text = $"Pending: {items.Count}";
+
+        // Group by target device for clarity
+        foreach (var group in items.GroupBy(p => p.TargetDisplayName))
+        {
+            var header = new ToolStripMenuItem($"→ {group.Key} ({group.Count()})")
+            {
+                Enabled = false,
+            };
+            _pendingMenu.DropDownItems.Add(header);
+
+            foreach (var p in group)
+            {
+                var name = Path.GetFileName(p.FilePath);
+                var sub = new ToolStripMenuItem(name);
+                if (!string.IsNullOrEmpty(p.LastError))
+                    sub.ToolTipText = p.LastError;
+                var cancelItem = new ToolStripMenuItem(
+                    "Cancel", null, (_, _) => _pending.Remove(p.Id));
+                var openLocationItem = new ToolStripMenuItem(
+                    "Show in Explorer", null, (_, _) =>
+                    {
+                        try
+                        {
+                            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                            {
+                                FileName = "explorer.exe",
+                                Arguments = "/select,\"" + p.FilePath + "\"",
+                                UseShellExecute = true,
+                            });
+                        }
+                        catch { /* ignore */ }
+                    });
+                sub.DropDownItems.Add(openLocationItem);
+                sub.DropDownItems.Add(cancelItem);
+                _pendingMenu.DropDownItems.Add(sub);
+            }
+        }
+
+        _pendingMenu.DropDownItems.Add(new ToolStripSeparator());
+        _pendingMenu.DropDownItems.Add(new ToolStripMenuItem(
+            "Cancel all", null, (_, _) => _pending.Clear()));
     }
 
     /// <summary>
@@ -205,10 +272,20 @@ public sealed class TrayApp : IDisposable
         if (paths.Length == 0) return;
 
         var devices = _browser.Snapshot().ToList();
+
+        // No phone visible right now → try to enqueue against a previously
+        // connected one so the user doesn't lose the file. mDNS Found
+        // event will flush the queue when the phone comes back.
         if (devices.Count == 0)
         {
-            ShowBalloon("No phones found",
-                "Wait for the phone to appear on the LAN, then try again.");
+            var knownName = _settings.KnownDevices.Keys.FirstOrDefault();
+            if (knownName == null)
+            {
+                ShowBalloon("No phones configured",
+                    "Connect to a phone in the app first, then try again.");
+                return;
+            }
+            EnqueueForLater(knownName, TrimName(knownName), paths, "Phone offline");
             return;
         }
 
@@ -228,6 +305,17 @@ public sealed class TrayApp : IDisposable
         SendToTargetAsync(target, paths);
     }
 
+    private void EnqueueForLater(string deviceName, string displayName, string[] paths, string reason)
+    {
+        foreach (var p in paths.Where(File.Exists))
+        {
+            _pending.Add(deviceName, displayName, p, reason);
+        }
+        ShowBalloon($"Queued for {displayName}",
+            $"{paths.Length} file(s). Will send when phone is online.",
+            onClick: () => _menu.Show(System.Windows.Forms.Cursor.Position));
+    }
+
     private void SendToTargetAsync(DiscoveredService target, string[] paths)
     {
         var deviceLabel = TrimName(target.Name);
@@ -244,42 +332,55 @@ public sealed class TrayApp : IDisposable
 
         _ = System.Threading.Tasks.Task.Run(async () =>
         {
-            int ok = 0, fail = 0;
-            string? lastError = null;
+            int ok = 0;
+            var failedPaths = new List<(string Path, string? Error)>();
+            bool authFailed = false;
             foreach (var path in paths)
             {
                 var outcome = await Uploader.UploadAsync(target.Url, password, path);
                 if (outcome.Success) ok++;
-                else { fail++; lastError = outcome.Error; }
+                else
+                {
+                    failedPaths.Add((path, outcome.Error));
+                    if (outcome.Error != null && outcome.Error.Contains("401"))
+                        authFailed = true;
+                }
             }
             Post(() =>
             {
-                if (fail == 0)
+                if (ok > 0)
                 {
                     ShowBalloon(
                         $"Sent to {deviceLabel}",
                         ok == 1 ? Path.GetFileName(paths[0]) : $"{ok} file(s) sent",
                         onClick: _mounter.CurrentDrive != null ? _mounter.OpenInExplorer : null);
                 }
-                else if (lastError != null && lastError.Contains("401"))
+
+                if (authFailed && failedPaths.Count > 0)
                 {
-                    // PIN was rejected — prompt and retry once.
-                    Post(() =>
+                    // PIN rejected — prompt once, retry the failed batch.
+                    var fresh = AskPassword(deviceLabel, wrongPassword: true);
+                    if (fresh != null)
                     {
-                        var fresh = AskPassword(deviceLabel, wrongPassword: true);
-                        if (fresh != null)
-                        {
-                            _settings.SavePassword(target.Name, fresh);
-                            // Re-enqueue with the fresh PIN
-                            SendToTargetAsync(target, paths);
-                        }
-                    });
+                        _settings.SavePassword(target.Name, fresh);
+                        SendToTargetAsync(target, failedPaths.Select(f => f.Path).ToArray());
+                        return;
+                    }
+                    // User cancelled the prompt — queue for later
                 }
-                else
+
+                if (failedPaths.Count > 0)
                 {
+                    // Network failure or rejected auth → put the leftovers
+                    // into the pending queue. mDNS Found / next manual
+                    // attempt will retry them.
+                    foreach (var (path, err) in failedPaths)
+                    {
+                        _pending.Add(target.Name, deviceLabel, path, err);
+                    }
                     ShowBalloon(
-                        $"Send failed ({fail}/{paths.Length})",
-                        lastError ?? "unknown error");
+                        $"{failedPaths.Count} file(s) pending",
+                        $"Will retry when {deviceLabel} is online.");
                 }
             });
         });
@@ -294,7 +395,51 @@ public sealed class TrayApp : IDisposable
             {
                 _ = ConnectAsync(svc);
             }
+
+            // Flush any pending uploads queued for this device.
+            var pending = _pending.SnapshotForDevice(svc.Name);
+            if (pending.Count > 0)
+            {
+                _ = FlushPendingForDeviceAsync(svc, pending);
+            }
         });
+    }
+
+    private async System.Threading.Tasks.Task FlushPendingForDeviceAsync(
+        DiscoveredService device,
+        List<PendingUpload> pending)
+    {
+        var password = _settings.GetPassword(device.Name);
+        var deviceLabel = TrimName(device.Name);
+        int sent = 0;
+
+        foreach (var item in pending)
+        {
+            if (!File.Exists(item.FilePath))
+            {
+                _pending.Remove(item.Id);  // source vanished
+                continue;
+            }
+            var outcome = await Uploader.UploadAsync(device.Url, password, item.FilePath);
+            if (outcome.Success)
+            {
+                _pending.Remove(item.Id);
+                sent++;
+            }
+            else
+            {
+                _pending.RecordFailure(item.Id, outcome.Error);
+                if (outcome.Error != null && outcome.Error.Contains("401")) break; // PIN bad
+            }
+        }
+
+        if (sent > 0)
+        {
+            Post(() => ShowBalloon(
+                $"Pending → {deviceLabel}",
+                $"Sent {sent} queued file(s).",
+                onClick: _mounter.CurrentDrive != null ? _mounter.OpenInExplorer : null));
+        }
     }
 
     private void OnDeviceLost(string name)

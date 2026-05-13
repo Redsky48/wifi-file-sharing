@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WiFi Share — API</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+body { background: var(--bg); }
+.docs {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+    color: var(--text);
+    line-height: 1.6;
+}
+.docs h1 { margin: 0 0 4px; font-size: 28px; color: var(--primary); }
+.docs h2 { margin-top: 36px; font-size: 20px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+.docs h3 { margin-top: 26px; font-size: 15px; color: var(--primary); font-family: ui-monospace, monospace; }
+.docs p { margin: 8px 0; }
+.docs ul { padding-left: 22px; }
+.docs li { margin: 4px 0; }
+.docs code {
+    background: var(--surface);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 13px;
+    border: 1px solid var(--border);
+}
+.docs pre {
+    background: #0f172a;
+    color: #e2e8f0;
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 12px 0;
+}
+.docs pre code { background: transparent; border: none; color: inherit; padding: 0; }
+.method {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    font-weight: 700;
+    color: white;
+    margin-right: 6px;
+}
+.method-get { background: #16a34a; }
+.method-put { background: #2563eb; }
+.method-post { background: #f59e0b; }
+.method-delete { background: #dc2626; }
+.endpoint {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 12px 0;
+}
+.endpoint-title {
+    font-family: ui-monospace, monospace;
+    font-size: 14px;
+    font-weight: 600;
+}
+.note {
+    background: rgba(25, 118, 210, 0.1);
+    border-left: 3px solid var(--primary);
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin: 14px 0;
+    font-size: 14px;
+}
+.note strong { color: var(--primary); }
+.toc {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 18px;
+    margin: 18px 0;
+}
+.toc h3 { margin: 0 0 8px; font-family: inherit; color: var(--text); }
+.toc ul { margin: 0; padding-left: 20px; }
+.toc a { color: var(--primary); text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.back-link {
+    display: inline-block;
+    margin-bottom: 16px;
+    color: var(--primary);
+    text-decoration: none;
+}
+.back-link:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="docs">
+    <a href="/" class="back-link">← Back to file browser</a>
+    <h1>WiFi Share — HTTP API</h1>
+    <p class="muted">Programmatic access to your phone's shared folder. Same auth, same endpoints the web UI and Windows companion use.</p>
+
+    <div class="toc">
+        <h3>On this page</h3>
+        <ul>
+            <li><a href="#auth">Authentication</a></li>
+            <li><a href="#send-file">Send a file</a> — the common case</li>
+            <li><a href="#files-api">Files API</a> — list, upload, download, delete</li>
+            <li><a href="#folders-api">Folder ops</a> — mkdir, rename, copy</li>
+            <li><a href="#meta-api">Metadata & search</a> — info, storage, file stat, search</li>
+            <li><a href="#system-api">System</a> — health, info, clients, queue, notify</li>
+            <li><a href="#examples">Language examples</a> — curl / PowerShell / Python / JS</li>
+            <li><a href="#watch-folder">Recipe: watch a PC folder, auto-send</a></li>
+        </ul>
+    </div>
+
+    <h2 id="auth">Authentication</h2>
+    <p>If the phone has a PIN set, every request needs HTTP Basic auth. The username is ignored — only the password matters.</p>
+    <pre><code>Authorization: Basic &lt;base64("user:&lt;PIN&gt;")&gt;</code></pre>
+    <p>If no PIN is set, requests work without the header. Public paths (<code>/</code>, <code>/docs</code>, <code>/static/*</code>, <code>/favicon.ico</code>, <code>/download/*</code>) never require auth.</p>
+    <div class="note">
+        <strong>Rate limit:</strong> 5 failed PINs from one IP within 60 seconds → 30-second lockout. Use the correct PIN.
+    </div>
+
+    <h2 id="send-file">Send a file to the phone</h2>
+    <p>The simplest endpoint — stream the file body straight in. Filename + folder come from the <code>path</code> query parameter.</p>
+
+    <div class="endpoint">
+        <span class="method method-put">PUT</span>
+        <span class="endpoint-title">/api/files?path=&lt;destination&gt;</span>
+    </div>
+
+    <h3>curl</h3>
+    <pre><code>curl -u user:123456 \
+     --upload-file ./report.pdf \
+     "http://192.168.1.179:8080/api/files?path=Inbox/report.pdf"</code></pre>
+
+    <h3>PowerShell</h3>
+    <pre><code>$pin  = "123456"
+$file = "C:\Users\me\report.pdf"
+$dest = "Inbox/report.pdf"
+
+$auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("user:$pin"))
+Invoke-RestMethod `
+  -Uri "http://192.168.1.179:8080/api/files?path=$([Uri]::EscapeDataString($dest))" `
+  -Method PUT `
+  -Headers @{ Authorization = "Basic $auth" } `
+  -InFile $file</code></pre>
+
+    <p>Response (201 Created):</p>
+    <pre><code>{
+  "saved": "report.pdf",
+  "path": "Inbox/report.pdf",
+  "size": 248301
+}</code></pre>
+
+    <p>If a file with the same name exists, the server auto-renames: <code>report.pdf</code> → <code>report (1).pdf</code>. The actual saved name is in the response's <code>saved</code> field.</p>
+
+    <h2 id="files-api">Files API</h2>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/files?path=&lt;folder&gt;</span>
+    </div>
+    <p>List a folder. Empty <code>path</code> = root. Response:</p>
+    <pre><code>{
+  "path": "Inbox",
+  "entries": [
+    {"name": "Pics",   "type": "folder", "modified": 1715200000000},
+    {"name": "a.jpg",  "type": "file",   "size": 12345,
+     "mime": "image/jpeg", "modified": 1715204000000}
+  ],
+  "allowUploads": true,
+  "allowDelete":  false
+}</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-put">PUT</span>
+        <span class="endpoint-title">/api/files?path=&lt;destination&gt;</span>
+    </div>
+    <p>Upload a single file with the raw body. See <a href="#send-file">above</a>. Returns 201 Created.</p>
+
+    <div class="endpoint">
+        <span class="method method-post">POST</span>
+        <span class="endpoint-title">/api/upload?path=&lt;folder&gt;</span>
+    </div>
+    <p>Multipart upload of one or more files. Use this from browser forms. Each form field with a filename gets saved. The <code>path</code> param is the destination folder (default: root).</p>
+    <pre><code>curl -u user:PIN \
+     -F "file=@report.pdf" \
+     -F "file=@photo.jpg" \
+     "http://phone:8080/api/upload?path=Inbox"</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/download?path=&lt;file&gt;[&amp;inline=1]</span>
+    </div>
+    <p>Download a file. <code>inline=1</code> makes the browser display it instead of saving. Honours HTTP <code>Range</code> headers — good for video/audio streaming.</p>
+
+    <div class="endpoint">
+        <span class="method method-delete">DELETE</span>
+        <span class="endpoint-title">/api/delete?path=&lt;file&gt;</span>
+    </div>
+    <p>Delete a file or folder. Requires the "Allow delete" toggle in phone Settings.</p>
+
+    <h2 id="folders-api">Folder operations</h2>
+
+    <div class="endpoint">
+        <span class="method method-post">POST</span>
+        <span class="endpoint-title">/api/mkdir?path=&lt;folder&gt;</span>
+    </div>
+    <p>Create a folder (and any missing parents) under the shared root. Idempotent — succeeds if it already exists.</p>
+    <pre><code>curl -X POST -u user:PIN "http://phone:8080/api/mkdir?path=Projects/2026/Q3"</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-post">POST</span>
+        <span class="endpoint-title">/api/move?from=&lt;src&gt;&amp;to=&lt;dst&gt;</span>
+    </div>
+    <p>Rename a file or folder. Source and destination must share the same parent folder (cross-folder moves use <code>/api/copy</code> + <code>/api/delete</code>).</p>
+    <pre><code>curl -X POST -u user:PIN \
+  "http://phone:8080/api/move?from=draft.txt&amp;to=final.txt"</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-post">POST</span>
+        <span class="endpoint-title">/api/copy?from=&lt;src&gt;&amp;to=&lt;dst&gt;</span>
+    </div>
+    <p>Server-side duplicate of a file (no PC bandwidth). Auto-renames on name collision. Returns 201 with the actual saved path.</p>
+    <pre><code>curl -X POST -u user:PIN \
+  "http://phone:8080/api/copy?from=Inbox/a.jpg&amp;to=Pics/a.jpg"</code></pre>
+
+    <h2 id="meta-api">Metadata &amp; search</h2>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/file?path=&lt;path&gt;</span>
+    </div>
+    <p>Stat a single file or folder (size, mime, modified). Cheaper than listing a parent folder.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/search?q=&lt;query&gt;[&amp;path=&lt;subroot&gt;][&amp;limit=200]</span>
+    </div>
+    <p>Recursive case-insensitive substring search. Returns up to <code>limit</code> matches (default 200, max 1000) plus a <code>truncated</code> boolean.</p>
+    <pre><code>curl -u user:PIN "http://phone:8080/api/search?q=invoice&amp;limit=20"</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/storage</span>
+    </div>
+    <p>Disk usage on the volume that holds the shared folder.</p>
+    <pre><code>{ "total": 256000000000, "used": 184000000000, "available": 72000000000 }</code></pre>
+
+    <h2 id="system-api">System</h2>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/health</span>
+        <span class="muted" style="margin-left:8px;font-size:12px;">public — no PIN</span>
+    </div>
+    <p>Liveness probe. Returns <code>{"status":"ok"}</code> when the server is running. Use this in monitoring / load balancers.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/info</span>
+        <span class="muted" style="margin-left:8px;font-size:12px;">public — no PIN</span>
+    </div>
+    <p>Server identity and capabilities — useful for discovery so the client can adapt before sending the PIN.</p>
+    <pre><code>{
+  "name": "WiFi Share",
+  "version": "0.5.0",
+  "device": "Pixel 9 Pro",
+  "manufacturer": "Google",
+  "sdk": 34,
+  "authRequired": true,
+  "allowUploads": true,
+  "allowDelete": false
+}</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/clients</span>
+    </div>
+    <p>List recently active clients (visible in the phone's "Connected" card).</p>
+
+    <div class="endpoint">
+        <span class="method method-post">POST</span>
+        <span class="endpoint-title">/api/notify</span>
+    </div>
+    <p>Push a custom system notification to the phone. Body is JSON. Great for CI hooks ("Build green"), home automations, monitoring alerts.</p>
+    <pre><code>curl -X POST -u user:PIN \
+     -H "Content-Type: application/json" \
+     -d '{"title":"Build done","text":"All tests green ✓"}' \
+     http://phone:8080/api/notify</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/queue/{clientId}</span>
+    </div>
+    <p>For companion apps: poll for files the phone wants to push to this client. Returns the next item metadata or <code>204 No Content</code>. Companions register first via <code>POST /api/clients/register</code>.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/queue/{clientId}/{itemId}</span>
+    </div>
+    <p>Download a queued item's body.</p>
+
+    <div class="endpoint">
+        <span class="method method-delete">DELETE</span>
+        <span class="endpoint-title">/api/queue/{clientId}/{itemId}</span>
+    </div>
+    <p>Acknowledge (ack) a queued item — removes it from the phone's queue. Call this after the body has been saved on the client.</p>
+
+    <h2 id="examples">More examples</h2>
+
+    <h3>Python (requests)</h3>
+    <pre><code>import requests
+
+phone = "http://192.168.1.179:8080"
+auth  = ("user", "123456")  # PIN as password
+
+# List files
+r = requests.get(f"{phone}/api/files", auth=auth)
+for entry in r.json()["entries"]:
+    print(entry["type"], entry["name"])
+
+# Send a file (streaming, no multipart)
+with open("report.pdf", "rb") as f:
+    r = requests.put(
+        f"{phone}/api/files",
+        params={"path": "Inbox/report.pdf"},
+        data=f,
+        auth=auth,
+    )
+print(r.json())</code></pre>
+
+    <h3>JavaScript (fetch)</h3>
+    <pre><code>const phone = "http://192.168.1.179:8080";
+const headers = { Authorization: "Basic " + btoa("user:123456") };
+
+// Send a Blob
+const blob = new Blob(["hello, phone!"], { type: "text/plain" });
+const url = `${phone}/api/files?path=` + encodeURIComponent("Inbox/note.txt");
+const resp = await fetch(url, { method: "PUT", headers, body: blob });
+console.log(await resp.json());</code></pre>
+
+    <h3>Plain HTTP (raw socket / Postman / etc.)</h3>
+    <pre><code>PUT /api/files?path=Inbox/note.txt HTTP/1.1
+Host: 192.168.1.179:8080
+Authorization: Basic dXNlcjoxMjM0NTY=
+Content-Type: text/plain
+Content-Length: 13
+
+hello, phone!</code></pre>
+
+    <h2 id="watch-folder">Recipe: PowerShell folder watcher</h2>
+    <p>Anything dropped in <code>C:\PhoneInbox</code> is auto-uploaded to the phone's <code>Inbox</code> folder.</p>
+    <pre><code>$phone = "http://192.168.1.179:8080"
+$pin   = "123456"
+$watch = "C:\PhoneInbox"
+$dest  = "Inbox"
+
+$auth = "Basic " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("user:$pin"))
+New-Item -ItemType Directory -Force -Path $watch | Out-Null
+
+$fsw = New-Object IO.FileSystemWatcher $watch
+$fsw.EnableRaisingEvents = $true
+
+Register-ObjectEvent $fsw Created -Action {
+    $path = $Event.SourceEventArgs.FullPath
+    Start-Sleep -Milliseconds 200  # let the writer finish
+    if (-not (Test-Path $path -PathType Leaf)) { return }
+    $name = [IO.Path]::GetFileName($path)
+    $url  = "$using:phone/api/files?path=" + [Uri]::EscapeDataString("$using:dest/$name")
+    try {
+        Invoke-RestMethod -Uri $url -Method PUT `
+            -Headers @{ Authorization = $using:auth } `
+            -InFile $path
+        Write-Host "Sent $name"
+    } catch {
+        Write-Warning "Failed $name`: $($_.Exception.Message)"
+    }
+}
+
+Write-Host "Watching $watch — drop files there to upload."
+Write-Host "Press Ctrl+C to stop."
+while ($true) { Start-Sleep -Seconds 1 }</code></pre>
+
+    <h3>Recipe: bash incoming watcher (Linux/macOS/WSL)</h3>
+    <pre><code>#!/usr/bin/env bash
+PHONE="http://192.168.1.179:8080"
+PIN="123456"
+WATCH="$HOME/PhoneInbox"
+DEST="Inbox"
+
+mkdir -p "$WATCH"
+inotifywait -m -e close_write --format '%f' "$WATCH" |
+while read fname; do
+    curl -sS -u "user:$PIN" \
+         --upload-file "$WATCH/$fname" \
+         "$PHONE/api/files?path=$DEST/$(printf %s "$fname" | jq -sRr @uri)" \
+        && echo "Sent $fname"
+done</code></pre>
+
+    <div class="note">
+        <strong>Discovery tip:</strong> if you don't want to hard-code the phone's IP, advertise via mDNS. The phone announces
+        <code>_wifishare._tcp.local</code> — Avahi / Bonjour / Windows DNS-SD can resolve it. Example:
+        <code>avahi-browse -tr _wifishare._tcp</code>.
+    </div>
+
+    <h2>Versioning</h2>
+    <p>This API is unversioned — endpoints have been stable since v0.5. The companion app, web UI, and these docs all hit the same surface.</p>
+</div>
+</body>
+</html>
