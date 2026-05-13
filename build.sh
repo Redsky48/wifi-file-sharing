@@ -116,11 +116,24 @@ delete_phone_file() {
     esac
 }
 
+# Returns 0 (true) if the filename is something this build owns and
+# should clean up. We're careful NOT to match other projects' artifacts
+# (e.g. VocalMonitor-*.apk) — only WiFi Share's own outputs:
+#   - WiFiShare-<ver>-debug-v<n>.apk     (current versioned naming)
+#   - app-debug.apk / app-debug (N).apk  (legacy pre-versioning name)
+#   - WiFiShareTray.exe / WiFiShareTray (N).exe (current windows exe)
+is_ours() {
+    local name="$1"
+    [[ "$name" == "$APK_PREFIX"* ]] && return 0
+    [[ "$name" =~ ^app-debug(\ \([0-9]+\))?\.apk$ ]] && return 0
+    [[ "$name" =~ ^WiFiShareTray(\ \([0-9]+\))?\.exe$ ]] && return 0
+    return 1
+}
+
 if [[ -n "$OLD_FILES" ]]; then
     DELETE_BLOCKED=0
     while IFS= read -r old; do
-        # Match APK by prefix; .exe is always WiFiShareTray.exe so match exact
-        if [[ "$old" == "$APK_PREFIX"* || "$old" == "WiFiShareTray.exe" ]]; then
+        if is_ours "$old"; then
             delete_phone_file "$old" || DELETE_BLOCKED=1
             [[ "$DELETE_BLOCKED" == "1" ]] && break
         fi
