@@ -99,8 +99,7 @@ case "$HTTP" in
     *)   echo "Phone returned HTTP $HTTP"; exit 1 ;;
 esac
 
-# Wipe previous APKs that share this build's prefix (everything before -v<N>)
-APK_PREFIX=$(echo "$APK_NAME" | sed -E 's/-v[0-9]+\.apk$/-v/')
+# Wipe any previously pushed WiFi Share APK/.exe on the phone.
 LIST_PATH_PARAM=$(encode_path "${PHONE_DEST:-}")
 LIST_RESP=$(curl -sS "${CURL_AUTH[@]}" "${PHONE_HOST}/api/files?path=${LIST_PATH_PARAM}" 2>/dev/null || echo "")
 OLD_FILES=$(printf %s "$LIST_RESP" \
@@ -128,12 +127,16 @@ delete_phone_file() {
 # Returns 0 (true) if the filename is something this build owns and
 # should clean up. We're careful NOT to match other projects' artifacts
 # (e.g. VocalMonitor-*.apk) — only WiFi Share's own outputs:
-#   - WiFiShare-<ver>-debug-v<n>.apk     (current versioned naming)
+#   - WiFiShare-<anything>.apk           (any version of WiFi Share)
+#   - WiFiShare-<anything> (N).apk       (Android's auto-renamed dupes)
 #   - app-debug.apk / app-debug (N).apk  (legacy pre-versioning name)
 #   - WiFiShareTray.exe / WiFiShareTray (N).exe (current windows exe)
+#
+# Note: we match *any* WiFiShare- APK version (not just APK_PREFIX) so
+# that bumping versionName actually wipes the previous version's APK.
 is_ours() {
     local name="$1"
-    [[ "$name" == "$APK_PREFIX"* ]] && return 0
+    [[ "$name" =~ ^WiFiShare-.*\.apk$ ]] && return 0
     [[ "$name" =~ ^app-debug(\ \([0-9]+\))?\.apk$ ]] && return 0
     [[ "$name" =~ ^WiFiShareTray(\ \([0-9]+\))?\.exe$ ]] && return 0
     return 1
