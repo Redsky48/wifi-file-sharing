@@ -10,8 +10,9 @@
 #      Output filename: WiFiShare-<versionName>-debug-v<versionCode>.apk
 #   4. git auto-commit if the working tree is dirty (so every green build
 #      is a guaranteed rollback point).
-#   5. Push APK + WiFiShareTray.exe to the phone via /api/files.
+#   5. Push APK to the phone via /api/files.
 #      Old artifacts with the same prefix are deleted first.
+#      (The .exe is bundled inside the APK assets — no separate upload.)
 #
 # Config (env vars):
 #   PHONE_HOST   e.g. http://192.168.1.179:8080  (default below)
@@ -106,6 +107,9 @@ OLD_FILES=$(printf %s "$LIST_RESP" \
     | grep -oE '"name":"[^"]+\.(apk|exe)"' \
     | sed 's/"name":"//;s/"$//' \
     || true)
+# Note: still match .exe so we clean up any WiFiShareTray.exe pushed by
+# earlier versions of this script. The .exe ships inside the APK assets
+# now, so we don't upload a fresh copy — just remove stale ones.
 
 delete_phone_file() {
     local rawname="$1"
@@ -160,13 +164,12 @@ upload_file() {
 }
 
 upload_file "$APK" "$APK_NAME"
-upload_file "windows-client/bin/Release/dist/WiFiShareTray.exe" "WiFiShareTray.exe"
 
 # Friendly system notification on the phone
 curl -sS -o /dev/null "${CURL_AUTH[@]}" \
     -H "Content-Type: application/json" \
-    -d "{\"title\":\"Build pushed\",\"text\":\"${APK_NAME} + WiFiShareTray.exe ready\"}" \
+    -d "{\"title\":\"Build pushed\",\"text\":\"${APK_NAME} ready\"}" \
     "${PHONE_HOST}/api/notify" 2>/dev/null || true
 
 echo
-echo "Build pushed. Open the file browser on the phone — both files are there."
+echo "Build pushed. Open the file browser on the phone to install the APK."
