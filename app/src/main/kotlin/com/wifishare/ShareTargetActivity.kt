@@ -65,7 +65,10 @@ class ShareTargetActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val uris = extractIncomingUris(intent)
+        val incoming = extractIncoming(intent)
+        val uris = incoming.uris
+        val sharedText = incoming.text
+        val sharedSubject = incoming.subject
         val hasImages = uris.any { ImageCompressor.isImageMime(contentResolver.getType(it)) }
 
         setContent {
@@ -76,7 +79,8 @@ class ShareTargetActivity : ComponentActivity() {
                     var customQuality by rememberSaveable { mutableIntStateOf(75) }
 
                     ShareTargetScreen(
-                        incoming = uris,
+                        uris = uris,
+                        sharedText = sharedText,
                         hasImages = hasImages,
                         preset = preset,
                         customScale = customScale,
@@ -88,7 +92,7 @@ class ShareTargetActivity : ComponentActivity() {
                                 ImageCompressor.Preset.CUSTOM -> customScale to customQuality
                                 else -> preset.scale to preset.quality
                             }
-                            sendTo(client, uris, preset, scale, quality)
+                            sendTo(client, uris, sharedText, sharedSubject, preset, scale, quality)
                         },
                         onCancel = { finish() },
                     )
@@ -97,8 +101,20 @@ class ShareTargetActivity : ComponentActivity() {
         }
     }
 
-    private fun extractIncomingUris(intent: Intent): List<Uri> {
-        return when (intent.action) {
+    private data class IncomingShare(
+        val uris: List<Uri>,
+        val text: String?,
+        val subject: String?,
+    )
+
+    /**
+     * Pulls everything useful out of the share intent: file URIs
+     * (EXTRA_STREAM / single + multiple) AND plain text / URLs shared via
+     * EXTRA_TEXT. Subject is kept around so we can use it as the filename
+     * for wrapped text — e.g. a browser shares EXTRA_SUBJECT="Page title".
+     */
+    private fun extractIncoming(intent: Intent): IncomingShare {
+        val uris: List<Uri> = when (intent.action) {
             Intent.ACTION_SEND -> {
                 val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
@@ -119,21 +135,28 @@ class ShareTargetActivity : ComponentActivity() {
             }
             else -> emptyList()
         }
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
+        val subject = intent.getStringExtra(Intent.EXTRA_SUBJECT)?.takeIf { it.isNotBlank() }
+        return IncomingShare(uris = uris, text = text, subject = subject)
     }
 
     private fun sendTo(
         client: Clients.Client,
         uris: List<Uri>,
+        sharedText: String?,
+        sharedSubject: String?,
         preset: ImageCompressor.Preset,
         scale: Float,
         quality: Int,
     ) {
-        if (uris.isEmpty()) {
+        if (uris.isEmpty() && sharedText.isNullOrEmpty()) {
             finish()
             return
         }
         lifecycleScope.launch {
-            val staged = withContext(Dispatchers.IO) { stage(uris, preset, scale, quality) }
+            val staged = withContext(Dispatchers.IO) {
+                stage(uris, sharedText, sharedSubject, preset, scale, quality)
+            }
             staged.forEach { meta ->
                 Queue.enqueue(
                     clientId = client.clientId,
@@ -151,12 +174,35 @@ class ShareTargetActivity : ComponentActivity() {
 
     private fun stage(
         uris: List<Uri>,
+        sharedText: String?,
+        sharedSubject: String?,
         preset: ImageCompressor.Preset,
         scale: Float,
         quality: Int,
     ): List<Staged> {
         val outDir = File(cacheDir, "outbox").apply { mkdirs() }
-        return uris.mapNotNull { uri -> stageOne(uri, outDir, preset, scale, quality) }
+        val staged = uris.mapNotNull { uri -> stageOne(uri, outDir, preset, scale, quality) }
+            .toMutableList()
+        if (!sharedText.isNullOrEmpty()) {
+            stageText(sharedText, sharedSubject, outDir)?.let { staged += it }
+        }
+        return staged
+    }
+
+    /**
+     * Wraps shared plain text / URL into a temp .txt file so the receiving
+     * Windows tray opens it via ShellExecute (default editor: Notepad).
+     * Filename comes from EXTRA_SUBJECT if present (e.g. browser page title),
+     * else "shared-text-<timestamp>.txt".
+     */
+    private fun stageText(text: String, subject: String?, outDir: File): Staged? {
+        val base = subject?.let { sanitize(it) }?.takeIf { it.isNotBlank() }
+            ?: "shared-text-${System.currentTimeMillis()}"
+        val file = File(outDir, "$base.txt")
+        return runCatching {
+            file.writeText(text, Charsets.UTF_8)
+            Staged(name = file.name, size = file.length(), mime = "text/plain", file = file)
+        }.getOrNull()
     }
 
     private fun stageOne(
@@ -267,7 +313,8 @@ class ShareTargetActivity : ComponentActivity() {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ShareTargetScreen(
-    incoming: List<Uri>,
+    uris: List<Uri>,
+    sharedText: String?,
     hasImages: Boolean,
     preset: ImageCompressor.Preset,
     customScale: Float,
@@ -283,13 +330,34 @@ private fun ShareTargetScreen(
 
     var showCustomDialog by remember { mutableStateOf(false) }
 
+    val summary = buildString {
+        if (uris.isNotEmpty()) {
+            append(if (uris.size == 1) "1 file" else "${uris.size} files")
+        }
+        if (!sharedText.isNullOrEmpty()) {
+            if (isNotEmpty()) append(" + ")
+            append("1 text snippet")
+        }
+    }.ifEmpty { "Nothing to send" }
+
     Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Send to…", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text(
-            if (incoming.size == 1) "1 file"
-            else "${incoming.size} files",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Text(summary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        if (!sharedText.isNullOrEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Surface(
+                tonalElevation = 2.dp,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = sharedText.take(300) + if (sharedText.length > 300) "…" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+        }
 
         if (hasImages) {
             Spacer(Modifier.height(4.dp))
