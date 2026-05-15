@@ -1,13 +1,17 @@
 package com.wifishare
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import com.wifishare.screen.ScreenCastService
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -44,6 +48,28 @@ class MainActivity : ComponentActivity() {
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { /* result ignored */ }
+
+    /**
+     * MediaProjection permission flow — system shows a "Start now /
+     * Cancel" dialog; on accept we hand the result Intent to the screen
+     * cast service, which uses it to spawn the projection.
+     */
+    private val mediaProjectionPermission = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            ScreenCastService.start(this, result.resultCode, result.data!!)
+        }
+    }
+
+    fun requestScreenCast() {
+        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjectionPermission.launch(mgr.createScreenCaptureIntent())
+    }
+
+    fun stopScreenCast() {
+        ScreenCastService.stop(this)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

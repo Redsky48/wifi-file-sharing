@@ -9,4 +9,7 @@
     <string name="share_target_label">WiFi Share</string>
     <string name="notification_pending_title">Pending — waiting for PC</string>
     <string name="notification_pending_text">%1$d file(s) queued. Tap to manage.</string>
+    <string name="screencast_notification_title">Casting screen</string>
+    <string name="screencast_notification_text">Phone screen is streaming to browser viewers (video only).</string>
+    <string name="screencast_stop">Stop</string>
 </resources>

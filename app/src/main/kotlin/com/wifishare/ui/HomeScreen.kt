@@ -30,6 +30,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
+import com.wifishare.MainActivity
+import com.wifishare.screen.ScreenCast
 import com.wifishare.server.Clients
 import com.wifishare.server.ServerService
 import com.wifishare.util.WifiMonitor
@@ -136,6 +139,31 @@ fun HomeScreen(
             OutlinedButton(onClick = onOpenSettings, modifier = Modifier.weight(1f)) {
                 Text("Settings")
             }
+        }
+
+        // Screen cast — phone → browser viewer (video only, no audio).
+        // Only useful when the server is running, since the cast feed is
+        // served via the same HTTP endpoint.
+        val castState by ScreenCast.state.collectAsState()
+        val castRunning = castState == ScreenCast.State.Running
+        val ctx = LocalContext.current
+        OutlinedButton(
+            onClick = {
+                val act = (ctx as? MainActivity) ?: return@OutlinedButton
+                if (castRunning) act.stopScreenCast() else act.requestScreenCast()
+            },
+            enabled = serverState is ServerService.State.Running,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (castRunning) "Stop screen cast" else "Cast screen to browser")
+        }
+        if (castRunning && serverState is ServerService.State.Running) {
+            val running = serverState as ServerService.State.Running
+            Text(
+                "Open ${running.url}/screen in any browser on the LAN.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

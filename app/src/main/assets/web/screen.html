@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WiFi Share — Phone screen</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; background: #0a0a0c; color: #e6e6e6; font-family: system-ui, sans-serif; height: 100%; }
+  body { display: flex; flex-direction: column; min-height: 100vh; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: #14141a; border-bottom: 1px solid #222; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; flex: 1; }
+  .badge { background: #2e2e36; color: #aaa; font-size: 12px; padding: 2px 8px; border-radius: 4px; }
+  .live { background: #2c0d0d; color: #ff7a7a; }
+  .live::before { content: "● "; }
+  button { background: #2a2a32; color: inherit; border: 1px solid #3a3a44; padding: 6px 12px; border-radius: 4px; cursor: pointer; font: inherit; }
+  button:hover { background: #34343e; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 12px; }
+  #stage { max-width: 100%; max-height: calc(100vh - 80px); display: block; box-shadow: 0 0 0 1px #2a2a32; background: #0a0a0c; }
+  #stage.off { display: none; }
+  #offline { color: #888; text-align: center; max-width: 360px; }
+  #offline h2 { color: #aaa; font-weight: 600; margin: 0 0 8px; }
+  #offline p { margin: 4px 0; font-size: 14px; line-height: 1.5; }
+  code { background: #14141a; padding: 2px 5px; border-radius: 3px; }
+  footer { padding: 8px 14px; color: #666; font-size: 12px; background: #0d0d11; border-top: 1px solid #1a1a20; display: flex; gap: 16px; align-items: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Phone screen</h1>
+  <span id="status" class="badge">Checking…</span>
+  <button id="fs">Fullscreen</button>
+</header>
+<main>
+  <img id="stage" alt="Phone screen">
+  <div id="offline" style="display:none">
+    <h2>Screen cast is off</h2>
+    <p>Open the WiFi Share app on the phone and tap <b>Cast screen</b>. The page will auto-refresh.</p>
+    <p>You can also poll <code>GET /api/screen/status</code> from a script.</p>
+  </div>
+</main>
+<footer>
+  <span id="dims">—</span>
+  <span id="fps">— fps</span>
+  <span style="flex:1"></span>
+  <span>Video only · no audio</span>
+</footer>
+<script>
+  const stage = document.getElementById('stage');
+  const status = document.getElementById('status');
+  const offline = document.getElementById('offline');
+  const dims = document.getElementById('dims');
+  const fpsEl = document.getElementById('fps');
+  const fsBtn = document.getElementById('fs');
+
+  let frames = 0, lastFpsTick = performance.now(), running = false;
+
+  async function checkStatus() {
+    try {
+      const r = await fetch('/api/screen/status', { credentials: 'include' });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      if (j.running) {
+        if (!running) {
+          running = true;
+          // bust browser cache so the <img> opens a fresh MJPEG conn
+          stage.src = '/api/screen?t=' + Date.now();
+          stage.classList.remove('off');
+          offline.style.display = 'none';
+          status.textContent = 'Live';
+          status.classList.add('live');
+        }
+        dims.textContent = j.width && j.height ? `${j.width} × ${j.height}` : '—';
+      } else {
+        if (running) {
+          running = false;
+          stage.src = '';
+        }
+        stage.classList.add('off');
+        offline.style.display = '';
+        status.textContent = 'Off';
+        status.classList.remove('live');
+        dims.textContent = '—';
+        fpsEl.textContent = '— fps';
+      }
+    } catch (e) {
+      status.textContent = 'Error';
+      offline.style.display = '';
+    }
+  }
+
+  // Each frame the <img> renders fires a load event (MJPEG is one continuous response, but each part triggers a paint).
+  // Most browsers fire load on first render only — fall back to polling status for liveness.
+  setInterval(checkStatus, 2000);
+  checkStatus();
+
+  // Approximate fps via timer that watches naturalWidth changes — naive but good enough.
+  setInterval(() => {
+    if (!running) return;
+    const now = performance.now();
+    const dt = (now - lastFpsTick) / 1000;
+    if (dt > 0) fpsEl.textContent = `${(frames / dt).toFixed(1)} fps`;
+    frames = 0;
+    lastFpsTick = now;
+  }, 1000);
+  // Hook load events — fires once per multipart part on Chrome/Edge/Safari.
+  stage.addEventListener('load', () => frames++);
+
+  fsBtn.addEventListener('click', () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else stage.requestFullscreen?.();
+  });
+</script>
+</body>
+</html>

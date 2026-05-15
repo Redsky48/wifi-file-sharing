@@ -3,6 +3,7 @@ package com.wifishare.server
 import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
+import com.wifishare.screen.ScreenCast
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoWSD
 import org.json.JSONArray
@@ -145,6 +146,10 @@ class FileServer(
                 path == "/api/notify" -> notifyEndpoint(session)
                 path == "/api/events" -> sseEventsEndpoint(session)
                 path == "/api/manifest" -> manifestEndpoint()
+                path == "/api/screen" -> screenMjpegEndpoint()
+                path == "/api/screen.jpg" -> screenSingleFrameEndpoint()
+                path == "/api/screen/status" -> screenStatusEndpoint()
+                path == "/screen" -> serveAsset("web/screen.html", "text/html; charset=utf-8")
                 else -> notFound()
             }
         } catch (t: Throwable) {
@@ -930,6 +935,58 @@ class FileServer(
     }
 
     /**
+     * MJPEG stream of the phone's screen — `multipart/x-mixed-replace`
+     * with each part being one JPEG. A bare <img src="/api/screen"> tag
+     * in any browser renders this live, no JS needed.
+     *
+     * If cast isn't running we return 503 so the viewer page can show a
+     * "screen cast is off" message rather than just spinning.
+     */
+    private fun screenMjpegEndpoint(): Response {
+        if (ScreenCast.state.value != ScreenCast.State.Running) {
+            return json(Response.Status.lookup(503) ?: Response.Status.INTERNAL_ERROR,
+                """{"error":"screen cast is not running","hint":"open the phone app and tap Cast screen"}""")
+        }
+        val boundary = "wifishareframe"
+        val stream = MjpegInputStream(boundary)
+        stream.startSubscriber()
+        val resp = newChunkedResponse(
+            Response.Status.OK,
+            "multipart/x-mixed-replace; boundary=$boundary",
+            stream,
+        )
+        resp.addHeader("Cache-Control", "no-cache, no-store, must-revalidate")
+        resp.addHeader("Pragma", "no-cache")
+        resp.addHeader("Connection", "close")
+        resp.addHeader("X-Accel-Buffering", "no")
+        return resp
+    }
+
+    /** Single most-recent JPEG frame as a one-shot response. Handy for thumbnails / curl screenshots. */
+    private fun screenSingleFrameEndpoint(): Response {
+        val frame = ScreenCast.latestJpeg
+            ?: return json(Response.Status.lookup(503) ?: Response.Status.INTERNAL_ERROR,
+                """{"error":"no frame available","hint":"start screen cast in the phone app first"}""")
+        val resp = newFixedLengthResponse(
+            Response.Status.OK, "image/jpeg",
+            ByteArrayInputStream(frame), frame.size.toLong(),
+        )
+        resp.addHeader("Cache-Control", "no-store")
+        return resp
+    }
+
+    private fun screenStatusEndpoint(): Response {
+        val running = ScreenCast.state.value == ScreenCast.State.Running
+        val out = JSONObject()
+            .put("running", running)
+            .put("frameCount", ScreenCast.frameCount)
+            .put("width", ScreenCast.width)
+            .put("height", ScreenCast.height)
+            .put("note", "GET /api/screen for MJPEG stream, /api/screen.jpg for single frame, /screen for viewer page")
+        return json(Response.Status.OK, out.toString())
+    }
+
+    /**
      * JSON manifest matching the tray's /api/manifest — lists every
      * endpoint with a short description so AI agents can fetch one file
      * and know the API surface.
@@ -956,6 +1013,10 @@ class FileServer(
             "GET /api/queue/{clientId}" to "Pull next queued file for this client.",
             "WS  /ws/events" to "WebSocket push channel — same source as /api/events.",
             "GET /api/events" to "Server-Sent Events: live stream of every event envelope.",
+            "GET /api/screen" to "MJPEG screen-cast stream (multipart/x-mixed-replace). Requires user to start cast from phone app.",
+            "GET /api/screen.jpg" to "Latest single JPEG frame of the screen cast.",
+            "GET /api/screen/status" to "Cast on/off + frame counter + dimensions.",
+            "GET /screen" to "Browser viewer HTML page that displays /api/screen.",
             "GET /docs" to "Human-readable HTML docs for all of the above.",
         ).forEach { (path, desc) ->
             endpoints.put(JSONObject().put("path", path).put("description", desc))
@@ -972,6 +1033,8 @@ class FileServer(
                     "client.connected",
                     "client.disconnected",
                     "notification",
+                    "screen.started",
+                    "screen.stopped",
                 ).forEach { put(it) }
             })
             .put("endpoints", endpoints)
@@ -984,6 +1047,94 @@ class FileServer(
      * lines. close() unsubscribes from PhoneEvents.events and unblocks
      * the reader.
      */
+    /**
+     * Streams the [ScreenCast] frame feed as MJPEG. Each call to read()
+     * blocks until the next published frame, then writes one part:
+     *
+     *   --boundary
+     *   Content-Type: image/jpeg
+     *   Content-Length: <len>
+     *   <blank line>
+     *   <jpeg bytes>
+     *
+     * close() unblocks any pending read and ends the response.
+     */
+    private inner class MjpegInputStream(private val boundary: String) : InputStream() {
+        private val queue = LinkedBlockingQueue<ByteArray>(2)
+        private var pending: ByteArray? = null
+        private var pendingPos = 0
+        private val closed = AtomicBoolean(false)
+        private var subscriberThread: Thread? = null
+        private var lastSeq = 0L
+
+        fun startSubscriber() {
+            subscriberThread = Thread({
+                runCatching {
+                    kotlinx.coroutines.runBlocking {
+                        ScreenCast.frameTicks.collect { seq ->
+                            if (closed.get()) return@collect
+                            if (seq == lastSeq) return@collect
+                            lastSeq = seq
+                            val jpeg = ScreenCast.latestJpeg ?: return@collect
+                            val header = (
+                                "--$boundary\r\n" +
+                                    "Content-Type: image/jpeg\r\n" +
+                                    "Content-Length: ${jpeg.size}\r\n\r\n"
+                                ).toByteArray(Charsets.US_ASCII)
+                            val trailer = "\r\n".toByteArray(Charsets.US_ASCII)
+                            // Compose into one part so a slow writer can't split a frame.
+                            val part = ByteArray(header.size + jpeg.size + trailer.size)
+                            System.arraycopy(header, 0, part, 0, header.size)
+                            System.arraycopy(jpeg, 0, part, header.size, jpeg.size)
+                            System.arraycopy(trailer, 0, part, header.size + jpeg.size, trailer.size)
+                            // Drop on overflow — viewers are at most a frame behind.
+                            queue.offer(part)
+                        }
+                    }
+                }
+            }, "wifishare-mjpeg-sub").apply { isDaemon = true; start() }
+        }
+
+        override fun read(): Int {
+            while (true) {
+                val current = pending
+                if (current != null && pendingPos < current.size) {
+                    return current[pendingPos++].toInt() and 0xff
+                }
+                if (closed.get()) return -1
+                val next = queue.poll(2, TimeUnit.SECONDS) ?: continue
+                if (next.isEmpty() && closed.get()) return -1
+                pending = next
+                pendingPos = 0
+            }
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val first = read()
+            if (first < 0) return -1
+            b[off] = first.toByte()
+            var written = 1
+            val current = pending
+            if (current != null) {
+                val avail = current.size - pendingPos
+                val toCopy = minOf(avail, len - written)
+                if (toCopy > 0) {
+                    System.arraycopy(current, pendingPos, b, off + written, toCopy)
+                    pendingPos += toCopy
+                    written += toCopy
+                }
+            }
+            return written
+        }
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) {
+                queue.offer(ByteArray(0))
+                subscriberThread?.interrupt()
+            }
+        }
+    }
+
     private inner class EventInputStream : InputStream() {
         private val queue = LinkedBlockingQueue<ByteArray>(256)
         private var pending: ByteArray? = null

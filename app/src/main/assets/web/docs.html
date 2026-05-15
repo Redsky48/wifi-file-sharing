@@ -109,6 +109,8 @@ body { background: var(--bg); }
             <li><a href="#folders-api">Folder ops</a> — mkdir, rename, copy</li>
             <li><a href="#meta-api">Metadata & search</a> — info, storage, file stat, search</li>
             <li><a href="#system-api">System</a> — health, info, clients, queue, notify</li>
+            <li><a href="#screen-cast">Screen cast</a> — phone screen → browser (video only)</li>
+            <li><a href="#push-events">Push events</a> — WebSocket + Server-Sent Events for AI agents</li>
             <li><a href="#examples">Language examples</a> — curl / PowerShell / Python / JS</li>
             <li><a href="#watch-folder">Recipe: watch a PC folder, auto-send</a></li>
         </ul>
@@ -308,6 +310,72 @@ Invoke-RestMethod `
         <span class="endpoint-title">/api/queue/{clientId}/{itemId}</span>
     </div>
     <p>Acknowledge (ack) a queued item — removes it from the phone's queue. Call this after the body has been saved on the client.</p>
+
+    <h2 id="screen-cast">Screen cast</h2>
+    <p>Mirror the phone's screen to any browser on the LAN. Video only — no audio, by design. Start it from the phone app's <b>Cast screen to browser</b> button; the system permission dialog appears the first time.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/screen</span>
+    </div>
+    <p>Viewer HTML page. Open it in any LAN browser. Auto-detects whether the cast is on; full-screen toggle in the header.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/screen</span>
+    </div>
+    <p>Raw MJPEG stream (<code>multipart/x-mixed-replace; boundary=wifishareframe</code>). Drop it straight into an <code>&lt;img&gt;</code> tag:</p>
+    <pre><code>&lt;img src="http://phone:8080/api/screen"&gt;</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/screen.jpg</span>
+    </div>
+    <p>One-shot latest JPEG frame — handy for thumbnails or shell scripts:</p>
+    <pre><code>curl -u user:PIN http://phone:8080/api/screen.jpg -o latest.jpg</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/screen/status</span>
+    </div>
+    <p>JSON: <code>{ running, frameCount, width, height }</code>. Tail this to see if cast is live.</p>
+
+    <h2 id="push-events">Push events</h2>
+    <p>Subscribe to a live stream of every interesting event the phone emits — file transfers, queue changes, client connect/disconnect, custom notifications. Two transports deliver the same envelopes; pick whichever your client supports.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">WS</span>
+        <span class="endpoint-title">/ws/events</span>
+    </div>
+    <p>WebSocket. Browsers and JS clients should connect with credentials in the URL (Basic auth on WS handshakes from <code>fetch</code> isn't supported). Server sends a <code>hello</code> frame on connect and a ping every 20s.</p>
+    <pre><code>// Browser / Node
+const ws = new WebSocket("ws://user:PIN@phone:8080/ws/events");
+ws.onmessage = e =&gt; console.log(JSON.parse(e.data));</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/events</span>
+    </div>
+    <p>Server-Sent Events — curl- and shell-friendly. Tail it live with:</p>
+    <pre><code>curl -N -u user:PIN http://phone:8080/api/events</code></pre>
+    <p>Sample frame:</p>
+    <pre><code>data: {"type":"transfer.uploaded","ts":1762345678901,"seq":42,"data":{"name":"vacation.jpg"}}</code></pre>
+
+    <h3>Event types</h3>
+    <pre><code>transfer.uploaded    {name}          file uploaded to the phone
+transfer.downloaded  {name}          file downloaded from the phone
+transfer.deleted     {name}          file deleted via /api/delete
+queue.changed        {count, items}  pending-upload queue changed
+client.connected     {clientId,name,address}    companion registered
+client.disconnected  {clientId,name,address}    inactivity-pruned (~5 min)
+notification         {title, body}   /api/notify was called</code></pre>
+    <p>Every envelope carries a monotonic <code>seq</code> field — agents that reconnect can spot dropped events by looking for gaps.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/manifest</span>
+    </div>
+    <p>Structured JSON describing every endpoint above plus the list of event types — fetch one URL and an AI agent can self-discover the API surface.</p>
 
     <h2 id="examples">More examples</h2>
 

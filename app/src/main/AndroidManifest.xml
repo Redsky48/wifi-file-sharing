@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -63,6 +64,14 @@
             android:name=".server.ServerService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Screen cast: MediaProjection requires a dedicated foreground
+             service type on Android 14+. Captures phone screen frames and
+             streams them as MJPEG to LAN browsers. -->
+        <service
+            android:name=".screen.ScreenCastService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
 
         <!-- Quick Settings tile (pull-down panel) — toggle server with one tap. -->
         <service
