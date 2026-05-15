@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import fi.iki.elonen.NanoHTTPD
+import fi.iki.elonen.NanoWSD
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -12,12 +13,15 @@ import java.io.FileInputStream
 import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class FileServer(
     private val context: Context,
     port: Int,
     private val config: Config,
-) : NanoHTTPD(port) {
+) : NanoWSD(port) {
 
     data class Config(
         val folderUri: Uri,
@@ -28,7 +32,36 @@ class FileServer(
 
     private val webdav = WebDavHandler(context, config)
 
-    override fun serve(session: IHTTPSession): Response {
+    /**
+     * NanoWSD requires a separate hook for non-WS HTTP requests. The
+     * superclass's serve() checks for the Upgrade header and routes
+     * websocket-style requests to openWebSocket() — everything else
+     * comes here.
+     */
+    override fun serveHttp(session: IHTTPSession): Response = handleHttp(session)
+
+    /**
+     * NanoWSD calls this for any request with `Upgrade: websocket`. We
+     * route by path; the only WS endpoint we expose is /ws/events, which
+     * pushes the same envelope stream as the SSE endpoint.
+     *
+     * Auth: same Basic-auth scheme as REST — return an immediately-closing
+     * socket if the client didn't authenticate. Browsers can't send Basic
+     * auth on WS handshakes from JS, so they need to either embed creds
+     * in the URL (ws://user:pin@host) or hit /api/events instead.
+     */
+    override fun openWebSocket(handshake: IHTTPSession): NanoWSD.WebSocket {
+        if (!isAuthorized(handshake)) {
+            return RejectedWebSocket(handshake, reason = "unauthorized")
+        }
+        val path = handshake.uri.trimEnd('/').ifEmpty { "/" }
+        return when (path) {
+            "/ws/events" -> EventsWebSocket(handshake)
+            else -> RejectedWebSocket(handshake, reason = "unknown path")
+        }
+    }
+
+    private fun handleHttp(session: IHTTPSession): Response {
         return try {
             // Server is in graceful shutdown — tell clients to give up.
             if (ShutdownSignal.armed) {
@@ -110,6 +143,8 @@ class FileServer(
                 path == "/api/move" -> moveEndpoint(session)
                 path == "/api/copy" -> copyEndpoint(session)
                 path == "/api/notify" -> notifyEndpoint(session)
+                path == "/api/events" -> sseEventsEndpoint(session)
+                path == "/api/manifest" -> manifestEndpoint()
                 else -> notFound()
             }
         } catch (t: Throwable) {
@@ -867,6 +902,261 @@ class FileServer(
 
     private fun error(msg: String) =
         json(Response.Status.INTERNAL_ERROR, JSONObject().put("error", msg).toString())
+
+    /**
+     * Server-Sent Events stream of PhoneEvents envelopes. Same source as
+     * the /ws/events WebSocket; this endpoint exists so curl / shell
+     * agents can subscribe without a WebSocket client:
+     *
+     *     curl -N -u user:PIN http://phone:8080/api/events
+     */
+    private fun sseEventsEndpoint(session: IHTTPSession): Response {
+        val stream = EventInputStream()
+        // We can't subscribe to PhoneEvents.events directly (it's a
+        // SharedFlow) from a non-coroutine context. Use a launching helper
+        // tied to the stream's lifetime. The InputStream's close() cancels
+        // the collection.
+        stream.subscribeOnNewThread()
+
+        // Hello frame so curl sees something immediately and confirms the
+        // upgrade. SSE comments start with ':' and clients must ignore them.
+        stream.pushLine(": hello ${System.currentTimeMillis()}\n\n")
+
+        val resp = newChunkedResponse(Response.Status.OK, "text/event-stream; charset=utf-8", stream)
+        resp.addHeader("Cache-Control", "no-cache")
+        resp.addHeader("Connection", "keep-alive")
+        resp.addHeader("X-Accel-Buffering", "no")
+        return resp
+    }
+
+    /**
+     * JSON manifest matching the tray's /api/manifest — lists every
+     * endpoint with a short description so AI agents can fetch one file
+     * and know the API surface.
+     */
+    private fun manifestEndpoint(): Response {
+        val endpoints = JSONArray()
+        listOf(
+            "GET /api/health" to "Liveness probe.",
+            "GET /api/info" to "Server identity (device name, version).",
+            "GET /api/storage" to "Free / total bytes on the shared storage.",
+            "GET /api/files" to "List files in the shared folder.",
+            "PUT /api/files?path=<name>" to "Upload a file with the raw bytes as body.",
+            "POST /api/upload" to "Multipart upload (alternative).",
+            "GET /api/download?name=<file>" to "Download a single file.",
+            "POST /api/delete?path=<file>" to "Delete a file (requires Allow delete).",
+            "GET /api/file?path=<file>" to "Single-file stat (size, modified, mime).",
+            "GET /api/search?q=<text>" to "Recursive search by filename.",
+            "POST /api/mkdir?path=<dir>" to "Create a folder (idempotent).",
+            "POST /api/move?from=&to=" to "Rename a file within the same parent.",
+            "POST /api/copy?from=&to=" to "Server-side copy.",
+            "POST /api/notify" to "Pop a system notification on the phone — body: {title, text}.",
+            "GET /api/clients" to "Active clients (recent IPs + companion registrations).",
+            "POST /api/clients/register" to "Register a stable clientId / friendly name.",
+            "GET /api/queue/{clientId}" to "Pull next queued file for this client.",
+            "WS  /ws/events" to "WebSocket push channel — same source as /api/events.",
+            "GET /api/events" to "Server-Sent Events: live stream of every event envelope.",
+            "GET /docs" to "Human-readable HTML docs for all of the above.",
+        ).forEach { (path, desc) ->
+            endpoints.put(JSONObject().put("path", path).put("description", desc))
+        }
+        val out = JSONObject()
+            .put("name", "WiFi Share phone API")
+            .put("description", "REST + push API served from the Android phone for AI agents / scripts.")
+            .put("eventTypes", JSONArray().apply {
+                listOf(
+                    "transfer.uploaded",
+                    "transfer.downloaded",
+                    "transfer.deleted",
+                    "queue.changed",
+                    "client.connected",
+                    "client.disconnected",
+                    "notification",
+                ).forEach { put(it) }
+            })
+            .put("endpoints", endpoints)
+        return json(Response.Status.OK, out.toString(2))
+    }
+
+    /**
+     * Custom InputStream that NanoHTTPD reads in its chunked-response
+     * loop. Internally backed by a BlockingQueue of pre-serialised SSE
+     * lines. close() unsubscribes from PhoneEvents.events and unblocks
+     * the reader.
+     */
+    private inner class EventInputStream : InputStream() {
+        private val queue = LinkedBlockingQueue<ByteArray>(256)
+        private var pending: ByteArray? = null
+        private var pendingPos = 0
+        private val closed = AtomicBoolean(false)
+        private var subscriberThread: Thread? = null
+
+        fun pushLine(line: String) {
+            if (closed.get()) return
+            queue.offer(line.toByteArray(Charsets.UTF_8))
+        }
+
+        fun subscribeOnNewThread() {
+            // We run a tiny dedicated thread that walks PhoneEvents.events
+            // (collected via collectLatest in a runBlocking on this thread)
+            // so we avoid pulling in CoroutineScope machinery here.
+            subscriberThread = Thread({
+                runCatching {
+                    kotlinx.coroutines.runBlocking {
+                        PhoneEvents.events.collect { ev ->
+                            if (closed.get()) return@collect
+                            val json = JSONObject().apply {
+                                put("type", ev.type)
+                                put("ts", ev.ts)
+                                put("seq", ev.seq)
+                                put("data", JSONObject(ev.data))
+                            }.toString()
+                            pushLine("data: $json\n\n")
+                        }
+                    }
+                }
+            }, "phone-sse-subscriber").also { it.isDaemon = true; it.start() }
+
+            // Heartbeat thread so dead clients are detected within ~20 s.
+            Thread({
+                while (!closed.get()) {
+                    Thread.sleep(20_000)
+                    pushLine(": ping ${System.currentTimeMillis()}\n\n")
+                }
+            }, "phone-sse-heartbeat").also { it.isDaemon = true; it.start() }
+        }
+
+        override fun read(): Int {
+            while (true) {
+                val current = pending
+                if (current != null && pendingPos < current.size) {
+                    return current[pendingPos++].toInt() and 0xff
+                }
+                if (closed.get()) return -1
+                val next = queue.poll(2, TimeUnit.SECONDS) ?: continue
+                if (next.isEmpty() && closed.get()) return -1
+                pending = next
+                pendingPos = 0
+            }
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            // Block for at least one byte; copy what's locally buffered.
+            val first = read()
+            if (first < 0) return -1
+            b[off] = first.toByte()
+            var written = 1
+            val current = pending
+            if (current != null) {
+                val avail = current.size - pendingPos
+                val toCopy = minOf(avail, len - written)
+                if (toCopy > 0) {
+                    System.arraycopy(current, pendingPos, b, off + written, toCopy)
+                    pendingPos += toCopy
+                    written += toCopy
+                }
+            }
+            return written
+        }
+
+        override fun close() {
+            if (closed.compareAndSet(false, true)) {
+                queue.offer(ByteArray(0))
+                subscriberThread?.interrupt()
+            }
+        }
+    }
+}
+
+/**
+ * WebSocket pushed to clients hitting /ws/events. Forwards every
+ * PhoneEvents envelope as a JSON text frame; sends a hello on connect
+ * and a ping every 20 s.
+ */
+private class EventsWebSocket(handshake: NanoHTTPD.IHTTPSession) : NanoWSD.WebSocket(handshake) {
+
+    private val subscriberThread: Thread = Thread {
+        runCatching {
+            kotlinx.coroutines.runBlocking {
+                PhoneEvents.events.collect { ev ->
+                    val json = JSONObject().apply {
+                        put("type", ev.type)
+                        put("ts", ev.ts)
+                        put("seq", ev.seq)
+                        put("data", JSONObject(ev.data))
+                    }.toString()
+                    runCatching { send(json) }.onFailure {
+                        throw kotlinx.coroutines.CancellationException("ws closed")
+                    }
+                }
+            }
+        }
+    }.apply { isDaemon = true; name = "phone-ws-subscriber" }
+
+    private val pingThread: Thread = Thread {
+        try {
+            while (!Thread.currentThread().isInterrupted) {
+                Thread.sleep(20_000)
+                runCatching { ping(byteArrayOf(0)) }
+            }
+        } catch (_: InterruptedException) { /* normal */ }
+    }.apply { isDaemon = true; name = "phone-ws-ping" }
+
+    override fun onOpen() {
+        runCatching {
+            send("""{"type":"hello","ts":${System.currentTimeMillis()}}""")
+        }
+        subscriberThread.start()
+        pingThread.start()
+    }
+
+    override fun onClose(
+        code: fi.iki.elonen.NanoWSD.WebSocketFrame.CloseCode?,
+        reason: String?,
+        initiatedByRemote: Boolean,
+    ) {
+        subscriberThread.interrupt()
+        pingThread.interrupt()
+    }
+
+    override fun onMessage(message: fi.iki.elonen.NanoWSD.WebSocketFrame?) {
+        // We don't accept client commands over the socket. Ignore.
+    }
+
+    override fun onPong(pong: fi.iki.elonen.NanoWSD.WebSocketFrame?) { /* no-op */ }
+
+    override fun onException(exception: IOException?) {
+        subscriberThread.interrupt()
+        pingThread.interrupt()
+    }
+}
+
+/**
+ * Stand-in WebSocket for unauthorized / unknown-path WS handshakes —
+ * closes the connection immediately so the client doesn't sit there
+ * thinking it's connected to a real event stream.
+ */
+private class RejectedWebSocket(
+    handshake: NanoHTTPD.IHTTPSession,
+    private val reason: String,
+) : NanoWSD.WebSocket(handshake) {
+    override fun onOpen() {
+        runCatching {
+            close(
+                fi.iki.elonen.NanoWSD.WebSocketFrame.CloseCode.PolicyViolation,
+                reason,
+                false,
+            )
+        }
+    }
+    override fun onClose(
+        code: fi.iki.elonen.NanoWSD.WebSocketFrame.CloseCode?,
+        reason: String?,
+        initiatedByRemote: Boolean,
+    ) { /* no-op */ }
+    override fun onMessage(message: fi.iki.elonen.NanoWSD.WebSocketFrame?) { /* no-op */ }
+    override fun onPong(pong: fi.iki.elonen.NanoWSD.WebSocketFrame?) { /* no-op */ }
+    override fun onException(exception: IOException?) { /* no-op */ }
 }
 
 private class TransferTrackingInputStream(

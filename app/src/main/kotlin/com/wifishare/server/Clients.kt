@@ -91,6 +91,7 @@ object Clients {
     /** Called from POST /api/clients/register — promotes anon entry to named. */
     fun register(address: String, providedClientId: String?, name: String): Client {
         val now = System.currentTimeMillis()
+        val wasRegistered = byAddress[address]?.registered == true
         val finalClientId = providedClientId?.takeIf { it.isNotBlank() }
             ?: byAddress[address]?.clientId
             ?: UUID.randomUUID().toString()
@@ -113,6 +114,14 @@ object Clients {
             )
         }!!
         publish()
+        if (!wasRegistered) {
+            // Don't spam re-registers as new connections — only first promote
+            PhoneEvents.push("client.connected", mapOf(
+                "clientId" to updated.clientId,
+                "name" to updated.name,
+                "address" to updated.address,
+            ))
+        }
         return updated
     }
 
@@ -130,7 +139,16 @@ object Clients {
         val cutoff = System.currentTimeMillis() - ACTIVE_WINDOW_MS
         val toRemove = byAddress.entries.filter { it.value.lastSeen < cutoff }
         toRemove.forEach { byAddress.remove(it.key) }
-        if (toRemove.isNotEmpty()) publish()
+        if (toRemove.isNotEmpty()) {
+            publish()
+            toRemove.forEach { (_, c) ->
+                PhoneEvents.push("client.disconnected", mapOf(
+                    "clientId" to c.clientId,
+                    "name" to c.name,
+                    "address" to c.address,
+                ))
+            }
+        }
     }
 
     fun clear() {

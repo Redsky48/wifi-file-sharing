@@ -22,5 +22,11 @@ object Transfers {
 
     fun emit(event: TransferEvent) {
         _events.tryEmit(event)
+        val type = when (event) {
+            is TransferEvent.Uploaded -> "transfer.uploaded"
+            is TransferEvent.Downloaded -> "transfer.downloaded"
+            is TransferEvent.Deleted -> "transfer.deleted"
+        }
+        PhoneEvents.push(type, mapOf("name" to event.name))
     }
 }

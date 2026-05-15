@@ -24,5 +24,9 @@ object Notifications {
 
     fun emit(title: String, body: String) {
         _events.tryEmit(Custom(title, body))
+        PhoneEvents.push("notification", mapOf(
+            "title" to title,
+            "body" to body,
+        ))
     }
 }

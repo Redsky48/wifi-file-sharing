@@ -12,8 +12,8 @@ android {
         applicationId = "com.wifishare"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.7.0"
+        versionCode = 8
+        versionName = "0.8.0"
         resourceConfigurations += listOf("en")
 
         // ---- AdMob configuration ----
@@ -114,6 +114,7 @@ dependencies {
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+    implementation("org.nanohttpd:nanohttpd-websocket:2.3.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
     // Google Mobile Ads (AdMob). Bundles Play Services dependency.

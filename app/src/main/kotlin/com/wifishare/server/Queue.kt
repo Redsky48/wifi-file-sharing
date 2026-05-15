@@ -125,6 +125,19 @@ object Queue {
     }
 
     private fun publish() {
-        _state.value = synchronized(lock) { items.values.toList() }
+        val snapshot = synchronized(lock) { items.values.toList() }
+        _state.value = snapshot
+        PhoneEvents.push("queue.changed", mapOf(
+            "count" to snapshot.size,
+            "items" to snapshot.map {
+                mapOf(
+                    "id" to it.id,
+                    "clientId" to it.clientId,
+                    "name" to it.name,
+                    "size" to it.size,
+                    "mime" to it.mime,
+                )
+            },
+        ))
     }
 }
