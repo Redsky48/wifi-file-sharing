@@ -197,6 +197,15 @@ public sealed class TrayApp : IDisposable
         _browser = new MdnsBrowser();
         _browser.Found += OnDeviceFound;
         _browser.Lost += OnDeviceLost;
+        _browser.Found += d => LocalEvents.Push("device.found", new
+        {
+            name = d.Name,
+            address = d.Address.ToString(),
+            port = (int)d.Port,
+            url = d.Url,
+            authRequired = d.AuthRequired,
+        });
+        _browser.Lost += name => LocalEvents.Push("device.lost", new { name });
         _browser.Start();
 
         _health.Lost += OnPhoneVanished;
@@ -207,6 +216,11 @@ public sealed class TrayApp : IDisposable
         _ipc.Start();
 
         _pending.Changed += () => Post(RebuildPendingMenu);
+        _pending.Changed += () => LocalEvents.Push("pending.changed", new
+        {
+            count = _pending.Count,
+            items = _pending.Snapshot(),
+        });
         RebuildPendingMenu();
 
         // Loopback-only HTTP API so AI agents / scripts on this PC can
@@ -814,6 +828,12 @@ public sealed class TrayApp : IDisposable
 
     private void OnFileReceived(ReceivedFile file)
     {
+        LocalEvents.Push("file.received", new
+        {
+            name = file.Name,
+            path = file.Path,
+            size = file.Size,
+        });
         Post(() =>
         {
             ShowBalloon(
@@ -897,6 +917,11 @@ public sealed class TrayApp : IDisposable
         return sb.ToString();
     }
 
+    // Last value pushed to LocalEvents — we only emit state.changed when
+    // the tuple actually changes, otherwise the firehose floods clients
+    // with no-op renders (UpdateUi runs on every menu redraw too).
+    private (AppState State, string? Drive)? _lastEmittedState;
+
     private void UpdateUi()
     {
         var backend = _mounter.CurrentKind switch
@@ -905,6 +930,19 @@ public sealed class TrayApp : IDisposable
             MountKind.WebDav => "WebDAV",
             _ => "",
         };
+
+        var snapshot = (_state, _mounter.CurrentDrive);
+        if (_lastEmittedState != snapshot)
+        {
+            _lastEmittedState = snapshot;
+            LocalEvents.Push("state.changed", new
+            {
+                state = _state.ToString(),
+                connectedTo = _connectedTo?.Name,
+                connectedUrl = _connectedTo?.Url,
+                mountedDrive = _mounter.CurrentDrive,
+            });
+        }
         var (label, color, tooltip) = _state switch
         {
             AppState.Connected => (

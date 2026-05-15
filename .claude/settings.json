@@ -12,7 +12,8 @@
       "Bash(curl -sS http://127.0.0.1:9099/api/settings)",
       "Bash(curl -sS http://127.0.0.1:9099/api/pending)",
       "Bash(curl -sS http://127.0.0.1:9099/api/manifest)",
-      "Bash(curl -sS http://127.0.0.1:9099/docs)"
+      "Bash(curl -sS http://127.0.0.1:9099/docs)",
+      "Bash(timeout 5 curl -sS -N http://127.0.0.1:9099/api/events)"
     ]
   }
 }

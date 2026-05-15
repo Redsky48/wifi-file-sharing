@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.WebSockets;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -157,7 +159,168 @@ public sealed class LocalApiServer : IDisposable
             {
                 return;
             }
+
+            var path = (ctx.Request.Url?.AbsolutePath ?? "/").TrimEnd('/').ToLowerInvariant();
+            if (path == "/ws/events" && ctx.Request.IsWebSocketRequest)
+            {
+                _ = Task.Run(() => HandleWebSocket(ctx));
+                continue;
+            }
+            if (path == "/api/events")
+            {
+                _ = Task.Run(() => HandleSseEvents(ctx, ct));
+                continue;
+            }
             _ = Task.Run(() => HandleRequest(ctx));
+        }
+    }
+
+    /// <summary>
+    /// WebSocket push channel — clients connect once and receive JSON
+    /// event frames as the tray emits them. No request body needed; we
+    /// just upgrade the HTTP request and stream frames.
+    /// </summary>
+    private async Task HandleWebSocket(HttpListenerContext ctx)
+    {
+        WebSocketContext? wsCtx = null;
+        try { wsCtx = await ctx.AcceptWebSocketAsync(subProtocol: null); }
+        catch { return; }
+
+        var ws = wsCtx.WebSocket;
+        var queue = new BlockingCollection<EventEnvelope>(boundedCapacity: 256);
+        Action<EventEnvelope> handler = ev =>
+        {
+            // Drop on overflow rather than block the producer. A slow
+            // client doesn't get to stall the whole tray.
+            queue.TryAdd(ev);
+        };
+        LocalEvents.Emit += handler;
+
+        try
+        {
+            // Send a hello frame so clients can detect a successful upgrade
+            // without waiting for the next real event.
+            await SendJsonFrame(ws, new
+            {
+                type = "hello",
+                ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                serverVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0",
+            });
+
+            // Drain the queue. The Take() blocks until a new event arrives.
+            // We use a CancellationTokenSource tied to a tiny background
+            // ping-loop so we still wake up to notice closed sockets even
+            // when no events come for a while.
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested && ws.State == WebSocketState.Open)
+                {
+                    try
+                    {
+                        await Task.Delay(20_000, cts.Token);
+                        await SendJsonFrame(ws, new { type = "ping", ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+                    }
+                    catch { return; }
+                }
+            });
+
+            // Drain inbound frames (and discard) — we don't accept commands
+            // over the socket, but we do need to notice close handshakes.
+            _ = Task.Run(async () =>
+            {
+                var buf = new byte[1024];
+                while (ws.State == WebSocketState.Open)
+                {
+                    try
+                    {
+                        var r = await ws.ReceiveAsync(new ArraySegment<byte>(buf), cts.Token);
+                        if (r.MessageType == WebSocketMessageType.Close) break;
+                    }
+                    catch { break; }
+                }
+                cts.Cancel();
+            });
+
+            foreach (var ev in queue.GetConsumingEnumerable(cts.Token))
+            {
+                if (ws.State != WebSocketState.Open) break;
+                try { await SendJsonFrame(ws, ev); }
+                catch { break; }
+            }
+        }
+        catch { /* client gone */ }
+        finally
+        {
+            LocalEvents.Emit -= handler;
+            queue.Dispose();
+            try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
+            ws.Dispose();
+        }
+    }
+
+    private static async Task SendJsonFrame(WebSocket ws, object payload)
+    {
+        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload, JsonOpts));
+        await ws.SendAsync(
+            new ArraySegment<byte>(bytes),
+            WebSocketMessageType.Text,
+            endOfMessage: true,
+            cancellationToken: CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Server-Sent Events fallback — agents on a curl-only diet can do
+    /// `curl -N http://127.0.0.1:9099/api/events` and get a line stream
+    /// of JSON envelopes. Same event source as the WebSocket endpoint.
+    /// </summary>
+    private async Task HandleSseEvents(HttpListenerContext ctx, CancellationToken serverCt)
+    {
+        ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
+        ctx.Response.ContentType = "text/event-stream";
+        ctx.Response.Headers["Cache-Control"] = "no-cache";
+        ctx.Response.Headers["Connection"] = "keep-alive";
+        ctx.Response.SendChunked = true;
+
+        var queue = new BlockingCollection<EventEnvelope>(boundedCapacity: 256);
+        Action<EventEnvelope> handler = ev => queue.TryAdd(ev);
+        LocalEvents.Emit += handler;
+
+        var output = ctx.Response.OutputStream;
+        var helloBytes = Encoding.UTF8.GetBytes(
+            $"event: hello\ndata: {{\"ts\": {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}}}\n\n");
+        try { await output.WriteAsync(helloBytes, 0, helloBytes.Length, serverCt); }
+        catch { LocalEvents.Emit -= handler; queue.Dispose(); return; }
+
+        try
+        {
+            // Background ping every 20 s so proxies / curl don't time-out
+            // when nothing is happening.
+            var pingTimer = new System.Threading.Timer(_ =>
+            {
+                var ping = Encoding.UTF8.GetBytes(
+                    $": ping {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}\n\n");
+                try { output.Write(ping, 0, ping.Length); output.Flush(); } catch { }
+            }, null, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(20));
+
+            try
+            {
+                foreach (var ev in queue.GetConsumingEnumerable(serverCt))
+                {
+                    var json = JsonSerializer.Serialize(ev, JsonOpts);
+                    var line = Encoding.UTF8.GetBytes($"data: {json}\n\n");
+                    await output.WriteAsync(line, 0, line.Length, serverCt);
+                    await output.FlushAsync(serverCt);
+                }
+            }
+            finally { pingTimer.Dispose(); }
+        }
+        catch { /* client disconnected */ }
+        finally
+        {
+            LocalEvents.Emit -= handler;
+            queue.Dispose();
+            try { ctx.Response.Close(); } catch { }
         }
     }
 
@@ -285,6 +448,8 @@ a{{color:#06c}}</style></head>
 <li><a href=""/api/settings""><code>GET /api/settings</code></a> — non-sensitive settings (no passwords)</li>
 <li><a href=""/api/health""><code>GET /api/health</code></a> — liveness probe</li>
 <li><a href=""/api/manifest""><code>GET /api/manifest</code></a> — structured endpoint spec for agents</li>
+<li><code>WS /ws/events</code> — WebSocket push channel (device found/lost, state, file, pending)</li>
+<li><a href=""/api/events""><code>GET /api/events</code></a> — Server-Sent Events fallback (curl-friendly)</li>
 </ul>
 <p>Discovery file: <code>%LOCALAPPDATA%\WiFiShare\local-api.json</code></p>
 </body></html>";
@@ -389,6 +554,19 @@ a{{color:#06c}}</style></head>
                     method = "GET",
                     path = "/docs",
                     description = "Human-readable HTML documentation.",
+                },
+                new
+                {
+                    method = "WS",
+                    path = "/ws/events",
+                    description = "WebSocket push channel. Connect once, receive JSON event envelopes as the tray emits them. Each frame is one JSON object with shape { Type, Data, Ts, Seq }. The server sends a hello frame on connect and a ping every 20s so dead sockets are detected quickly. Event types: device.found, device.lost, state.changed, file.received, pending.changed.",
+                    sampleFrame = new { Type = "file.received", Data = new { name = "foo.pdf", path = "C:\\Users\\edza\\Downloads\\foo.pdf", size = 12345 }, Ts = 1762345678901L, Seq = 42L },
+                },
+                new
+                {
+                    method = "GET",
+                    path = "/api/events",
+                    description = "Server-Sent Events fallback for curl-only consumers. Same event source as /ws/events, formatted as `data: <json>\\n\\n` lines. Use with `curl -N <url>/api/events` for a live tail.",
                 },
             },
             agentRecipes = new object[]
@@ -557,6 +735,41 @@ th{{background:#f2f4f6}}
 
 <h3><span class=""method"">GET</span><code>/api/manifest</code></h3>
 <p>This same surface in structured JSON form — designed for agents that prefer to fetch one machine-readable file instead of parsing HTML. Includes endpoint list, sample responses, and a few <code>agentRecipes</code> for common tasks.</p>
+
+<h2 id=""events"">Push events</h2>
+<p>Two ways to subscribe to the tray's event stream — pick whichever your agent finds easier. Both deliver the same envelopes, both are loopback-only.</p>
+
+<h3><span class=""method"" style=""background:#9333ea"">WS</span><code>/ws/events</code></h3>
+<p>WebSocket. Connect once, receive a hello frame, then JSON event frames as the tray emits them. Server sends a ping frame every 20s; client doesn't need to send anything.</p>
+<p>Envelope shape:</p>
+<pre><code>{{
+  ""Type"": ""file.received"",
+  ""Data"": {{ ""name"": ""foo.pdf"", ""path"": ""C:\\Users\\edza\\Downloads\\foo.pdf"", ""size"": 12345 }},
+  ""Ts"": 1762345678901,
+  ""Seq"": 42
+}}</code></pre>
+
+<h3><span class=""method"" style=""background:#16a34a"">SSE</span><code>/api/events</code></h3>
+<p>Server-Sent Events for curl/shell agents. Same source, plain-text framing:</p>
+<pre><code>curl -N http://127.0.0.1:9099/api/events</code></pre>
+<p>Output looks like:</p>
+<pre><code>event: hello
+data: {{""ts"": 1762345678901}}
+
+data: {{""Type"":""device.found"",""Data"":{{""name"":""…""}},""Ts"":…,""Seq"":1}}
+
+data: {{""Type"":""file.received"",""Data"":{{""name"":""foo.pdf""}},""Ts"":…,""Seq"":2}}</code></pre>
+
+<h3>Event types</h3>
+<table>
+<tr><th>Type</th><th>When</th><th>Data shape</th></tr>
+<tr><td><code>device.found</code></td><td>A phone is discovered on the LAN via mDNS</td><td><code>{{ name, address, port, url, authRequired }}</code></td></tr>
+<tr><td><code>device.lost</code></td><td>A previously-discovered phone disappears</td><td><code>{{ name }}</code></td></tr>
+<tr><td><code>state.changed</code></td><td>Tray transitions between Scanning / Connecting / Connected / Disconnected, or the mounted drive changes</td><td><code>{{ state, connectedTo, connectedUrl, mountedDrive }}</code></td></tr>
+<tr><td><code>file.received</code></td><td>A file is downloaded from the phone (via the upload queue)</td><td><code>{{ name, path, size }}</code></td></tr>
+<tr><td><code>pending.changed</code></td><td>The pending-upload queue gains, loses, or updates an entry</td><td><code>{{ count, items: [...] }}</code></td></tr>
+</table>
+<p>The <code>Seq</code> field monotonically increases per-process; agents can use it to detect dropped frames after a reconnect.</p>
 
 <h2 id=""recipes"">Agent recipes</h2>
 
