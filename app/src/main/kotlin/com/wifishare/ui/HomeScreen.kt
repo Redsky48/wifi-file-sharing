@@ -43,10 +43,13 @@ fun HomeScreen(
     val settings by viewModel.settings.collectAsState()
     val serverState by viewModel.serverState.collectAsState()
     val wifiState by viewModel.wifiState.collectAsState()
+    val currentIp by viewModel.currentIp.collectAsState()
     val clients by viewModel.clients.collectAsState()
     val pending by viewModel.pendingQueue.collectAsState()
 
     val wifiConnected = wifiState is WifiMonitor.State.Connected
+    val hasNetwork = currentIp != null
+    val onHotspot = hasNetwork && !wifiConnected
 
     val scroll = rememberScrollState()
     Column(
@@ -58,11 +61,13 @@ fun HomeScreen(
     ) {
         StatusCard(serverState)
 
-        if (!wifiConnected) {
+        if (!hasNetwork) {
             WarningCard(
-                title = "Not connected to WiFi",
-                body = "The server only runs over WiFi. Connect to a WiFi network, then tap Start.",
+                title = "No network",
+                body = "Connect to a WiFi network or turn on the phone's hotspot, then tap Start.",
             )
+        } else if (onHotspot) {
+            InfoRow("Mode", "Hotspot (PCs connect to this phone's AP)")
         }
 
         if (settings.folderUri == null) {
@@ -97,7 +102,7 @@ fun HomeScreen(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             val running = serverState is ServerService.State.Running
-            val canStart = settings.folderUri != null && wifiConnected
+            val canStart = settings.folderUri != null && hasNetwork
             Button(
                 onClick = {
                     if (running) viewModel.stopServer() else viewModel.startServer()

@@ -12,11 +12,15 @@ import com.wifishare.server.Clients
 import com.wifishare.server.Queue
 import com.wifishare.server.ServerService
 import com.wifishare.server.Transfers
+import com.wifishare.util.NetIp
 import com.wifishare.util.WifiMonitor
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
@@ -48,6 +52,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val wifiState = WifiMonitor.state
     val clients = Clients.state
     val pendingQueue = Queue.state
+
+    /**
+     * Best reachable LAN IPv4 across all interfaces — WiFi STA, softap
+     * (when phone hosts a hotspot), USB tether, etc. Polled every 3 s
+     * because Android does not surface ConnectivityManager callbacks
+     * for softap interfaces.
+     */
+    private val _currentIp = MutableStateFlow<String?>(NetIp.preferredIp(WifiMonitor.currentIp()))
+    val currentIp: StateFlow<String?> = _currentIp.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            while (true) {
+                _currentIp.value = NetIp.preferredIp(WifiMonitor.currentIp())
+                delay(3_000)
+            }
+        }
+    }
 
     fun cancelPending(itemId: String) {
         Queue.cancel(itemId)
@@ -114,7 +136,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun setPassword(value: String) = viewModelScope.launch { repo.setPassword(value) }
 
     fun startServer() {
-        if (wifiState.value !is WifiMonitor.State.Connected) return
+        if (_currentIp.value == null) return
         val s = settings.value
         val uri = s.folderUri ?: return
         // Only enforce auth when the PIN is fully entered (6 digits) — half

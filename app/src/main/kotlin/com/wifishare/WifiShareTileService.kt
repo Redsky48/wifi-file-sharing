@@ -10,6 +10,7 @@ import androidx.annotation.RequiresApi
 import com.wifishare.data.SettingsRepository
 import com.wifishare.server.Clients
 import com.wifishare.server.ServerService
+import com.wifishare.util.NetIp
 import com.wifishare.util.WifiMonitor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -73,8 +74,8 @@ class WifiShareTileService : TileService() {
                 launchActivity()
                 return@launch
             }
-            if (WifiMonitor.currentIp() == null) {
-                launchActivity() // user needs to connect to WiFi
+            if (NetIp.preferredIp(WifiMonitor.currentIp()) == null) {
+                launchActivity() // no WiFi STA *and* no hotspot — let user fix it
                 return@launch
             }
 
@@ -127,9 +128,9 @@ class WifiShareTileService : TileService() {
                     else -> "$clientCount connected"
                 }
             }
-            wifi !is WifiMonitor.State.Connected -> {
+            wifi !is WifiMonitor.State.Connected && NetIp.preferredIp(null) == null -> {
                 tile.state = Tile.STATE_UNAVAILABLE
-                tile.subtitle = "No WiFi"
+                tile.subtitle = "No WiFi / hotspot"
             }
             server is ServerService.State.Error -> {
                 tile.state = Tile.STATE_INACTIVE
