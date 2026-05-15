@@ -13,7 +13,8 @@
       "Bash(curl -sS http://127.0.0.1:9099/api/pending)",
       "Bash(curl -sS http://127.0.0.1:9099/api/manifest)",
       "Bash(curl -sS http://127.0.0.1:9099/docs)",
-      "Bash(timeout 5 curl -sS -N http://127.0.0.1:9099/api/events)"
+      "Bash(timeout 5 curl -sS -N http://127.0.0.1:9099/api/events)",
+      "Bash(PHONE_HOST=http://10.131.141.87:8080 PHONE_PIN=484848 bash build.sh)"
     ]
   }
 }
