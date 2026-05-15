@@ -16,6 +16,7 @@ import androidx.core.app.NotificationManagerCompat
 import com.wifishare.MainActivity
 import com.wifishare.R
 import com.wifishare.WifiShareApp
+import com.wifishare.util.NetIp
 import com.wifishare.util.WifiMonitor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,7 +27,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 
 class ServerService : Service() {
@@ -64,8 +64,11 @@ class ServerService : Service() {
         val allowDelete = intent.getBooleanExtra(EXTRA_ALLOW_DELETE, false)
         val password = intent.getStringExtra(EXTRA_PASSWORD).orEmpty()
 
-        val ip = WifiMonitor.currentIp() ?: run {
-            updateState(State.Error("Connect to WiFi first"))
+        // Prefer the WiFi STA address, fall back to hotspot / USB tether
+        // interface. The server itself binds to 0.0.0.0, so it's reachable
+        // on whatever interface ends up being live.
+        val ip = NetIp.preferredIp(WifiMonitor.currentIp()) ?: run {
+            updateState(State.Error("Connect to WiFi or turn on hotspot first"))
             stopSelf()
             return
         }
@@ -100,10 +103,24 @@ class ServerService : Service() {
 
         wifiWatchJob?.cancel()
         wifiWatchJob = scope.launch {
-            WifiMonitor.state.drop(1).collect { wifi ->
-                if (wifi is WifiMonitor.State.Disconnected) {
-                    updateState(State.Error("WiFi disconnected"))
+            // Poll every 3 s. We use polling instead of WifiMonitor callbacks
+            // alone because Android does not surface NetworkCallbacks for
+            // softap interfaces — turning the hotspot on/off won't trigger
+            // ConnectivityManager. Polling NetworkInterface picks it up.
+            var lastIp = ip
+            while (true) {
+                delay(3_000)
+                val live = NetIp.preferredIp(WifiMonitor.currentIp())
+                if (live == null) {
+                    updateState(State.Error("No network (turn on WiFi or hotspot)"))
                     handleStop()
+                    return@launch
+                }
+                if (live != lastIp) {
+                    lastIp = live
+                    val newUrl = "http://$live:$port"
+                    updateState(State.Running(newUrl, port))
+                    startForegroundCompat(buildNotification(newUrl))
                 }
             }
         }
