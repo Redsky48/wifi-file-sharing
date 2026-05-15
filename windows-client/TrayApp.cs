@@ -27,6 +27,7 @@ public sealed class TrayApp : IDisposable
     private readonly ToolStripMenuItem _uninstallItem;
     private readonly ToolStripMenuItem _installWinFspItem;
     private readonly ToolStripMenuItem _exitItem;
+    private readonly ToolStripMenuItem _apiDocsItem;
 
     private readonly Settings _settings = Settings.Load();
     private readonly MdnsBrowser _browser;
@@ -35,6 +36,7 @@ public sealed class TrayApp : IDisposable
     private readonly QueuePoller _queue;
     private readonly IpcServer _ipc = new();
     private readonly PendingUploads _pending = new();
+    private readonly LocalApiServer _localApi;
     private readonly SynchronizationContext _ui;
     private readonly ToolStripMenuItem _settingsItem;
     private readonly ToolStripMenuItem _sendToItem;
@@ -140,6 +142,11 @@ public sealed class TrayApp : IDisposable
         };
         _exitItem = new ToolStripMenuItem("Quit", null, (_, _) => Application.Exit());
 
+        _apiDocsItem = new ToolStripMenuItem(
+            "Local API docs (for agents)…",
+            null,
+            (_, _) => OpenLocalApiDocs());
+
         _menu = new ContextMenuStrip();
         _menu.Items.AddRange(new ToolStripItem[]
         {
@@ -159,6 +166,7 @@ public sealed class TrayApp : IDisposable
             _sendToItem,
             _shareTargetItem,
             _settingsItem,
+            _apiDocsItem,
             new ToolStripSeparator(),
             _installItem,
             _uninstallItem,
@@ -201,7 +209,40 @@ public sealed class TrayApp : IDisposable
         _pending.Changed += () => Post(RebuildPendingMenu);
         RebuildPendingMenu();
 
+        // Loopback-only HTTP API so AI agents / scripts on this PC can
+        // introspect tray state. URL is written to %LOCALAPPDATA%\WiFiShare\
+        // local-api.json for stable discovery.
+        _localApi = new LocalApiServer(
+            getStatus: BuildStatusSnapshot,
+            browser: _browser,
+            pending: _pending,
+            settings: _settings);
+        _localApi.Start();
+        if (_localApi.StartupError != null)
+        {
+            // Show once at startup so the user knows the API surface for
+            // AI agents is unavailable — but don't block the tray itself.
+            Post(() => ShowBalloon("Local API unavailable", _localApi.StartupError!));
+        }
+
         Application.ApplicationExit += (_, _) => Cleanup();
+    }
+
+    private StatusSnapshot BuildStatusSnapshot()
+    {
+        var version = System.Reflection.Assembly.GetExecutingAssembly()
+            .GetName().Version?.ToString() ?? "0";
+        return new StatusSnapshot(
+            State: _state.ToString(),
+            ConnectedToName: _connectedTo?.Name,
+            ConnectedToUrl: _connectedTo?.Url,
+            ConnectedToPort: _connectedTo?.Port ?? 0,
+            ConnectedToAuthRequired: _connectedTo?.AuthRequired ?? false,
+            AutoConnect: _autoConnect,
+            MountedDrive: _mounter.CurrentDrive,
+            WinFspInstalled: WinFspManager.IsInstalled(),
+            DeviceName: _settings.DeviceName,
+            Version: version);
     }
 
     private void RebuildPendingMenu()
@@ -629,6 +670,29 @@ public sealed class TrayApp : IDisposable
         dlg.ShowDialog();
     }
 
+    private void OpenLocalApiDocs()
+    {
+        var url = _localApi.Url;
+        if (string.IsNullOrEmpty(url))
+        {
+            ShowBalloon("Local API not running",
+                "The tray's local API failed to bind a port. Check Windows firewall settings or restart the tray.");
+            return;
+        }
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = $"{url}/docs",
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            ShowBalloon("Failed to open docs", ex.Message);
+        }
+    }
+
     private void ToggleShareTarget()
     {
         // Probe synchronously here since the user just clicked
@@ -923,6 +987,7 @@ public sealed class TrayApp : IDisposable
         try { _health.Stop(); } catch { }
         try { _queue.Stop(); } catch { }
         try { _ipc.Stop(); } catch { }
+        try { _localApi.Dispose(); } catch { }
         try { _ = _mounter.UnmountAsync(); } catch { }
         try { _tray.Visible = false; } catch { }
     }

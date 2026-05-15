@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(PHONE_PIN=484848 bash build.sh)"
+      "Bash(PHONE_PIN=484848 bash build.sh)",
+      "Bash(taskkill //IM WiFiShareTray.exe //F)",
+      "Bash(\"/c/Program Files/dotnet/dotnet.exe\" publish windows-client/WiFiShareTray.csproj -c Release --nologo --verbosity quiet)",
+      "Bash(start \"\" \"windows-client/bin/Release/dist/WiFiShareTray.exe\")",
+      "Bash(tasklist //FI \"IMAGENAME eq WiFiShareTray.exe\" //NH)",
+      "Bash(curl -sS http://127.0.0.1:9099/api/health)",
+      "Bash(curl -sS http://127.0.0.1:9099/api/status)",
+      "Bash(curl -sS http://127.0.0.1:9099/api/devices)",
+      "Bash(curl -sS http://127.0.0.1:9099/api/settings)",
+      "Bash(curl -sS http://127.0.0.1:9099/api/pending)",
+      "Bash(curl -sS http://127.0.0.1:9099/api/manifest)",
+      "Bash(curl -sS http://127.0.0.1:9099/docs)"
     ]
   }
 }
