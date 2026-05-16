@@ -23,10 +23,20 @@ public sealed class ScreenStreamForm : Form
 {
     private readonly PictureBox _pic;
     private readonly Label _statusLabel;
+    private readonly ToolStrip _toolbar;
+    private readonly ToolStripButton _recordBtn;
+    private readonly ToolStripLabel _recIndicator;
+    private readonly System.Windows.Forms.Timer _recTimer;
     private CancellationTokenSource? _cts;
     private readonly string _baseUrl;
     private readonly string? _password;
     private long _frameCount;
+
+    // Recording state — protected by [_recLock] because the MJPEG loop
+    // (background task) writes frames while the UI thread starts/stops.
+    private readonly object _recLock = new();
+    private MjpegAviWriter? _avi;
+    private int _lastFrameWidth, _lastFrameHeight;
 
     public ScreenStreamForm(string baseUrl, string? password)
     {
@@ -34,7 +44,7 @@ public sealed class ScreenStreamForm : Form
         _password = password;
 
         Text = "Phone screen — WiFi Share";
-        Size = new Size(960, 540);
+        Size = new Size(960, 580);
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.Black;
         Icon = LoadAppIcon();
@@ -57,16 +67,223 @@ public sealed class ScreenStreamForm : Form
             Font = new Font("Segoe UI", 9f),
             Text = "Connecting…",
         };
+
+        _recordBtn = new ToolStripButton("● Record")
+        {
+            ForeColor = Color.Tomato,
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            DisplayStyle = ToolStripItemDisplayStyle.Text,
+        };
+        _recordBtn.Click += (_, _) => ToggleRecording();
+        _recIndicator = new ToolStripLabel("")
+        {
+            ForeColor = Color.Tomato,
+            Font = new Font("Segoe UI", 9f),
+        };
+        var saveAsBtn = new ToolStripButton("Save current frame…")
+        {
+            DisplayStyle = ToolStripItemDisplayStyle.Text,
+            ForeColor = Color.Gainsboro,
+        };
+        saveAsBtn.Click += (_, _) => SaveCurrentFrame();
+        _toolbar = new ToolStrip
+        {
+            Dock = DockStyle.Top,
+            BackColor = Color.FromArgb(20, 20, 24),
+            ForeColor = Color.Gainsboro,
+            GripStyle = ToolStripGripStyle.Hidden,
+            RenderMode = ToolStripRenderMode.System,
+            Padding = new Padding(6, 2, 6, 2),
+        };
+        _toolbar.Items.AddRange(new ToolStripItem[]
+        {
+            _recordBtn,
+            _recIndicator,
+            new ToolStripSeparator(),
+            saveAsBtn,
+        });
+
         Controls.Add(_pic);
+        Controls.Add(_toolbar);
         Controls.Add(_statusLabel);
+
+        _recTimer = new System.Windows.Forms.Timer { Interval = 500 };
+        _recTimer.Tick += (_, _) => UpdateRecIndicator();
 
         KeyDown += (_, e) =>
         {
             if (e.KeyCode == Keys.Escape) Close();
             else if (e.KeyCode == Keys.F11) ToggleFullscreen();
+            else if (e.KeyCode == Keys.R && e.Control) ToggleRecording();
         };
         _pic.DoubleClick += (_, _) => ToggleFullscreen();
-        FormClosing += (_, _) => Stop();
+        FormClosing += (_, _) => { Stop(); StopRecording(silent: true); };
+    }
+
+    private void ToggleRecording()
+    {
+        lock (_recLock)
+        {
+            if (_avi != null) { StopRecording(silent: false); return; }
+        }
+        if (_lastFrameWidth == 0 || _lastFrameHeight == 0)
+        {
+            MessageBox.Show(this,
+                "Wait for the first frame to arrive before starting a recording.",
+                "Phone screen", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        var defaultDir = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
+        if (string.IsNullOrEmpty(defaultDir) || !Directory.Exists(defaultDir))
+            defaultDir = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+        var defaultName = $"wifishare-screen-{DateTime.Now:yyyyMMdd-HHmmss}.avi";
+        using var dlg = new SaveFileDialog
+        {
+            Title = "Save screen recording",
+            Filter = "AVI video (*.avi)|*.avi",
+            FileName = defaultName,
+            InitialDirectory = defaultDir,
+            OverwritePrompt = true,
+        };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            lock (_recLock)
+            {
+                _avi = new MjpegAviWriter(dlg.FileName, _lastFrameWidth, _lastFrameHeight);
+            }
+            _recordBtn.Text = "■ Stop recording";
+            _recTimer.Start();
+            UpdateRecIndicator();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Failed to start recording: " + ex.Message,
+                "Phone screen", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void StopRecording(bool silent, string? prefixMessage = null)
+    {
+        MjpegAviWriter? toClose = null;
+        lock (_recLock)
+        {
+            toClose = _avi;
+            _avi = null;
+        }
+        if (toClose == null) return;
+        var path = toClose.Path;
+        var frames = toClose.FrameCount;
+        var elapsed = toClose.Elapsed;
+        try { toClose.Dispose(); } catch { }
+        _recTimer.Stop();
+        if (IsHandleCreated && !IsDisposed)
+        {
+            BeginInvoke(new Action(() =>
+            {
+                _recordBtn.Text = "● Record";
+                _recIndicator.Text = "";
+            }));
+        }
+        if (!silent && File.Exists(path))
+        {
+            var size = new FileInfo(path).Length;
+            // Default action: open the saved file in Explorer (select it).
+            BeginInvoke(new Action(() =>
+            {
+                var header = prefixMessage == null ? "" : prefixMessage + "\n\n";
+                var openIt = MessageBox.Show(this,
+                    $"{header}Saved {frames} frames over {elapsed.TotalSeconds:0.0}s ({size / 1024 / 1024} MB)\n\n{path}\n\nOpen in Explorer?",
+                    prefixMessage != null ? "Screen sharing stopped — recording saved" : "Recording saved",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                if (openIt == DialogResult.Yes)
+                {
+                    try
+                    {
+                        System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{path}\"");
+                    }
+                    catch { }
+                }
+            }));
+        }
+    }
+
+    /// <summary>
+    /// Called from the tray when the phone-side cast is stopped (either
+    /// the user pressed Stop in the WiFi Share app, or revoked it from
+    /// Android's system panel). Behavior:
+    ///   - if we were recording: auto-finalize the AVI, show a notice,
+    ///     and leave the window open so the user can see what happened
+    ///     and click through to the saved file.
+    ///   - if we weren't recording: close the window — there's nothing
+    ///     to show, and the auto-reconnect loop would just spin forever.
+    /// </summary>
+    public void NotifyRemoteStopped()
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        BeginInvoke(new Action(() =>
+        {
+            MjpegAviWriter? hadRecording;
+            lock (_recLock) hadRecording = _avi;
+
+            // Stop the stream loop either way — the /api/screen endpoint
+            // is returning 503 now, no point retrying until the user
+            // starts cast again.
+            Stop();
+
+            if (hadRecording != null)
+            {
+                _statusLabel.Text = "Screen sharing stopped — saving recording…";
+                StopRecording(silent: false,
+                    prefixMessage: "The phone stopped sharing its screen.");
+                // Leave the window open so the user sees the save dialog
+                // and can choose to keep it or close it manually.
+            }
+            else
+            {
+                // Quiet path — just close.
+                Close();
+            }
+        }));
+    }
+
+    private void UpdateRecIndicator()
+    {
+        MjpegAviWriter? a;
+        lock (_recLock) a = _avi;
+        if (a == null) { _recIndicator.Text = ""; return; }
+        var e = a.Elapsed;
+        _recIndicator.Text = $"REC {e:mm\\:ss} · {a.FrameCount} frames";
+    }
+
+    private void SaveCurrentFrame()
+    {
+        Image? img = _pic.Image;
+        if (img == null)
+        {
+            MessageBox.Show(this, "No frame yet.", "Phone screen",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        using var dlg = new SaveFileDialog
+        {
+            Title = "Save current frame",
+            Filter = "JPEG image (*.jpg)|*.jpg|PNG image (*.png)|*.png",
+            FileName = $"wifishare-frame-{DateTime.Now:yyyyMMdd-HHmmss}.jpg",
+        };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            var fmt = dlg.FilterIndex == 2
+                ? System.Drawing.Imaging.ImageFormat.Png
+                : System.Drawing.Imaging.ImageFormat.Jpeg;
+            img.Save(dlg.FileName, fmt);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Save failed: " + ex.Message, "Phone screen",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private FormBorderStyle _prevBorder;
@@ -223,6 +440,15 @@ public sealed class ScreenStreamForm : Form
             if (jpeg == null) return;
             bytesPerFrame = jpeg.Length;
             DisplayFrame(jpeg);
+            // Mirror the frame into the AVI muxer if recording is on.
+            // Lock-free fast path: read the field, only enter lock if set.
+            if (_avi != null)
+            {
+                lock (_recLock)
+                {
+                    _avi?.WriteFrame(jpeg);
+                }
+            }
             _frameCount++;
             framesThisSecond++;
 
@@ -251,6 +477,8 @@ public sealed class ScreenStreamForm : Form
         {
             return; // skip corrupt frame
         }
+        _lastFrameWidth = newImg.Width;
+        _lastFrameHeight = newImg.Height;
         try
         {
             BeginInvoke(new Action(() =>

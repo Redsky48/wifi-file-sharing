@@ -744,6 +744,12 @@ public sealed class TrayApp : IDisposable
                 _phoneCasting = false;
                 _viewScreenItem.Visible = false;
                 LocalEvents.Push("phone.screen.stopped", new { reason = "phone" });
+                // If the viewer window is open, notify it so it can
+                // auto-save any in-progress recording or close itself.
+                if (_screenForm != null && !_screenForm.IsDisposed)
+                {
+                    try { _screenForm.NotifyRemoteStopped(); } catch { }
+                }
                 break;
             // Other events flow through to /api/events on the tray side
             // already (via re-emission below) — agents can subscribe
