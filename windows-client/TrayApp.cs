@@ -28,6 +28,7 @@ public sealed class TrayApp : IDisposable
     private readonly ToolStripMenuItem _installWinFspItem;
     private readonly ToolStripMenuItem _exitItem;
     private readonly ToolStripMenuItem _apiDocsItem;
+    private readonly ToolStripMenuItem _viewScreenItem;
 
     private readonly Settings _settings = Settings.Load();
     private readonly MdnsBrowser _browser;
@@ -37,6 +38,8 @@ public sealed class TrayApp : IDisposable
     private readonly IpcServer _ipc = new();
     private readonly PendingUploads _pending = new();
     private readonly LocalApiServer _localApi;
+    private readonly PhoneEventSubscriber _phoneEvents;
+    private bool _phoneCasting;
     private readonly SynchronizationContext _ui;
     private readonly ToolStripMenuItem _settingsItem;
     private readonly ToolStripMenuItem _sendToItem;
@@ -44,7 +47,9 @@ public sealed class TrayApp : IDisposable
 
     private AppState _state = AppState.Scanning;
     private DiscoveredService? _connectedTo;
+    private string? _connectedPassword; // held in-memory only; persisted DPAPI-encrypted in Settings
     private bool _autoConnect;
+    private ScreenStreamForm? _screenForm;
 
     public TrayApp()
     {
@@ -52,6 +57,8 @@ public sealed class TrayApp : IDisposable
         _autoConnect = _settings.AutoConnect;
         _queue = new QueuePoller(_settings);
         _queue.FileReceived += OnFileReceived;
+        _phoneEvents = new PhoneEventSubscriber(_settings);
+        _phoneEvents.EventReceived += ev => Post(() => OnPhoneEvent(ev));
 
         _statusItem = new ToolStripMenuItem("Scanning…") { Enabled = false };
         _backendItem = new ToolStripMenuItem(BackendStatusText()) { Enabled = false };
@@ -147,6 +154,14 @@ public sealed class TrayApp : IDisposable
             null,
             (_, _) => OpenLocalApiDocs());
 
+        _viewScreenItem = new ToolStripMenuItem(
+            "View phone screen…",
+            null,
+            (_, _) => OpenPhoneScreenViewer())
+        {
+            Visible = false, // shown only while phone is casting
+        };
+
         _menu = new ContextMenuStrip();
         _menu.Items.AddRange(new ToolStripItem[]
         {
@@ -159,6 +174,7 @@ public sealed class TrayApp : IDisposable
             _devicesSeparator,
             _openItem,
             _openWebItem,
+            _viewScreenItem,
             _disconnectItem,
             new ToolStripSeparator(),
             _autoConnectItem,
@@ -256,7 +272,9 @@ public sealed class TrayApp : IDisposable
             MountedDrive: _mounter.CurrentDrive,
             WinFspInstalled: WinFspManager.IsInstalled(),
             DeviceName: _settings.DeviceName,
-            Version: version);
+            Version: version,
+            PhoneIsCasting: _phoneCasting,
+            PhoneScreenViewerUrl: PhoneScreenViewerUrl());
     }
 
     private void RebuildPendingMenu()
@@ -613,8 +631,10 @@ public sealed class TrayApp : IDisposable
 
         _state = AppState.Connected;
         UpdateUi();
+        _connectedPassword = savedPassword;
         _health.Start(svc.Url, savedPassword);
         _queue.Start(svc.Url, savedPassword);
+        _phoneEvents.Start(svc.Url, savedPassword);
 
         var backendName = result.Kind == MountKind.WinFsp ? "WinFSP" : "WebDAV";
         ShowBalloon(
@@ -661,6 +681,19 @@ public sealed class TrayApp : IDisposable
     {
         _health.Stop();
         _queue.Stop();
+        _phoneEvents.Stop();
+        _connectedPassword = null;
+        if (_phoneCasting)
+        {
+            _phoneCasting = false;
+            _viewScreenItem.Visible = false;
+            LocalEvents.Push("phone.screen.stopped", new { reason = "disconnect" });
+        }
+        if (_screenForm != null && !_screenForm.IsDisposed)
+        {
+            try { _screenForm.Close(); } catch { }
+            _screenForm = null;
+        }
         var letter = _mounter.CurrentDrive;
         var kind = _mounter.CurrentKind;
         if (letter != null && kind == MountKind.WebDav) DriveLabel.Clear(letter);
@@ -682,6 +715,82 @@ public sealed class TrayApp : IDisposable
     {
         using var dlg = new SettingsDialog(_settings);
         dlg.ShowDialog();
+    }
+
+    /// <summary>
+    /// Reacts to events the phone pushes over /api/events. The main use
+    /// case right now is surfacing screen-cast start so the user knows
+    /// they can open the live viewer.
+    /// </summary>
+    private void OnPhoneEvent(PhoneEvent ev)
+    {
+        switch (ev.Type)
+        {
+            case "screen.started":
+                _phoneCasting = true;
+                _viewScreenItem.Visible = true;
+                var dims = "";
+                var w = ev.GetInt("width");
+                var h = ev.GetInt("height");
+                if (w != null && h != null) dims = $" ({w}×{h})";
+                ShowBalloon(
+                    "Phone is sharing its screen",
+                    "Click to open the live viewer in your browser.",
+                    onClick: OpenPhoneScreenViewer);
+                LocalEvents.Push("phone.screen.started",
+                    new { width = w, height = h, viewerUrl = PhoneScreenViewerUrl() });
+                break;
+            case "screen.stopped":
+                _phoneCasting = false;
+                _viewScreenItem.Visible = false;
+                LocalEvents.Push("phone.screen.stopped", new { reason = "phone" });
+                break;
+            // Other events flow through to /api/events on the tray side
+            // already (via re-emission below) — agents can subscribe
+            // there for everything.
+        }
+        // Mirror every phone event into the tray's local broadcaster so
+        // local agents subscribed to ws://127.0.0.1:9099/ws/events see
+        // both ends of the conversation without having to dial the phone.
+        LocalEvents.Push("phone." + ev.Type, new
+        {
+            ts = ev.Ts,
+            seq = ev.Seq,
+            data = ev.DataJson,
+        });
+    }
+
+    public bool IsPhoneCasting => _phoneCasting;
+    public string? PhoneScreenViewerUrl() =>
+        _connectedTo?.Url is { } baseUrl ? baseUrl.TrimEnd('/') + "/screen" : null;
+
+    private void OpenPhoneScreenViewer()
+    {
+        var baseUrl = _connectedTo?.Url;
+        if (string.IsNullOrEmpty(baseUrl))
+        {
+            ShowBalloon("No phone connected", "Connect to a phone first, then start screen cast from the phone app.");
+            return;
+        }
+
+        // Reuse an existing viewer window if we already have one — avoids
+        // a fresh HTTP connection (and a brief black flash) every click.
+        if (_screenForm != null && !_screenForm.IsDisposed)
+        {
+            try
+            {
+                _screenForm.Show();
+                _screenForm.BringToFront();
+                _screenForm.Activate();
+                return;
+            }
+            catch { _screenForm = null; }
+        }
+
+        var form = new ScreenStreamForm(baseUrl, _connectedPassword);
+        form.FormClosed += (_, _) => _screenForm = null;
+        _screenForm = form;
+        form.Show();
     }
 
     private void OpenLocalApiDocs()
@@ -1024,6 +1133,7 @@ public sealed class TrayApp : IDisposable
     {
         try { _health.Stop(); } catch { }
         try { _queue.Stop(); } catch { }
+        try { _phoneEvents.Dispose(); } catch { }
         try { _ipc.Stop(); } catch { }
         try { _localApi.Dispose(); } catch { }
         try { _ = _mounter.UnmountAsync(); } catch { }

@@ -67,10 +67,15 @@
           stage.src = '/api/screen?t=' + Date.now();
           stage.classList.remove('off');
           offline.style.display = 'none';
-          status.textContent = 'Live';
+          status.textContent = 'Live · ' + (j.mode || '');
           status.classList.add('live');
+        } else {
+          status.textContent = 'Live · ' + (j.mode || '');
         }
         dims.textContent = j.width && j.height ? `${j.width} × ${j.height}` : '—';
+        if (typeof j.fps === 'number' && j.fps > 0) {
+          fpsEl.textContent = j.fps.toFixed(1) + ' fps';
+        }
       } else {
         if (running) {
           running = false;

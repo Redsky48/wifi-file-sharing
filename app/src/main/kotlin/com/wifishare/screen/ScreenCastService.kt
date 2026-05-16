@@ -24,6 +24,8 @@ import com.wifishare.R
 import com.wifishare.WifiShareApp
 import com.wifishare.server.PhoneEvents
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Foreground service that captures the phone's screen via MediaProjection
@@ -47,11 +49,29 @@ class ScreenCastService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var captureThread: Thread? = null
+    private var encoderThread: Thread? = null
 
     // Display metrics captured at start so rotations don't crash us mid-cast.
     private var captureWidth = 0
     private var captureHeight = 0
     private var captureDensity = 0
+
+    private var activeMode: ScreenCast.Mode = ScreenCast.Mode.Balanced
+
+    // Pre-allocated bitmaps so the capture/encode loop never goes through
+    // GC pressure. The padded bitmap mirrors ImageReader's row layout
+    // (with potential row padding); the cropped bitmap is what we hand
+    // to JPEG.compress(). Both stay alive for the duration of the cast.
+    private var paddedBitmap: Bitmap? = null
+    private var croppedBitmap: Bitmap? = null
+    private var lastPaddedWidth = 0
+
+    // Hand-off slot from capture thread → encoder thread. Capture writes
+    // the next-frame bitmap reference; encoder takes ownership, encodes,
+    // and clears the slot. One frame in flight at a time (the next
+    // capture overwrites if encoder is still busy).
+    private val pendingFrame = AtomicReference<Bitmap?>(null)
+    private val frameReady = Semaphore(0)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -69,13 +89,16 @@ class ScreenCastService : Service() {
             stopSelfSafely()
             return
         }
+        val modeName = intent.getStringExtra(EXTRA_MODE)
+        activeMode = runCatching { ScreenCast.Mode.valueOf(modeName ?: "") }
+            .getOrDefault(ScreenCast.Mode.Balanced)
+        ScreenCast.setMode(activeMode)
 
         startForegroundCompat()
 
         // Determine the target capture dimensions. We pick the natural
-        // display size; rotations after cast starts will keep the same
-        // canvas (rotated content rendered inside).
-        val (w, h, density) = computeMetrics()
+        // display size scaled to the mode's long-edge cap.
+        val (w, h, density) = computeMetrics(activeMode.longEdge)
         captureWidth = w
         captureHeight = h
         captureDensity = density
@@ -118,10 +141,45 @@ class ScreenCastService : Service() {
     }
 
     private fun startCaptureLoop(reader: ImageReader) {
-        val targetFps = 12
-        val frameIntervalMs = 1000L / targetFps
-        val jpegQuality = 70
+        val mode = activeMode
+        val frameIntervalMs = 1000L / mode.targetFps
+        val jpegQuality = mode.jpegQuality
 
+        // ── Encoder thread ────────────────────────────────────────────
+        // Receives bitmaps from the capture thread via [pendingFrame],
+        // JPEG-encodes them, and publishes to ScreenCast. Runs in parallel
+        // with capture so we can overlap copy + encode + next acquire.
+        val baos = ByteArrayOutputStream(96 * 1024)
+        val fpsWindowMs = 1000L
+        var windowStart = System.currentTimeMillis()
+        var framesInWindow = 0
+        encoderThread = Thread({
+            try {
+                while (!Thread.currentThread().isInterrupted) {
+                    frameReady.acquire()
+                    val bmp = pendingFrame.getAndSet(null) ?: continue
+                    baos.reset()
+                    bmp.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
+                    ScreenCast.publishFrame(baos.toByteArray(), bmp.width, bmp.height)
+
+                    framesInWindow++
+                    val now = System.currentTimeMillis()
+                    val elapsed = now - windowStart
+                    if (elapsed >= fpsWindowMs) {
+                        ScreenCast.setMeasuredFps(framesInWindow * 1000f / elapsed)
+                        framesInWindow = 0
+                        windowStart = now
+                    }
+                }
+            } catch (_: InterruptedException) { /* normal */ }
+            catch (_: Throwable) { stopSelfSafely() }
+        }, "wifishare-encoder").apply { isDaemon = true; start() }
+
+        // ── Capture thread ───────────────────────────────────────────
+        // Pulls the latest frame from ImageReader, copies into our
+        // pre-allocated bitmap (creating it on first use / on dimension
+        // change), and signals the encoder. If the encoder is still busy
+        // we just overwrite — the encoder always sees the newest frame.
         captureThread = Thread({
             try {
                 while (!Thread.currentThread().isInterrupted) {
@@ -130,31 +188,58 @@ class ScreenCastService : Service() {
                     if (img != null) {
                         try {
                             val plane = img.planes[0]
-                            val buffer = plane.buffer
                             val rowStride = plane.rowStride
                             val pixelStride = plane.pixelStride
                             val rowPadding = rowStride - pixelStride * img.width
-
-                            // ImageReader gives us RGBA8888 with potential
-                            // row padding. Bitmap.createBitmap with the
-                            // padded width then crops back avoids copying
-                            // each row manually.
                             val paddedWidth = img.width + rowPadding / pixelStride
-                            val bmp = Bitmap.createBitmap(
-                                paddedWidth, img.height, Bitmap.Config.ARGB_8888
-                            )
-                            bmp.copyPixelsFromBuffer(buffer)
 
-                            val cropped = if (paddedWidth != img.width) {
-                                val c = Bitmap.createBitmap(bmp, 0, 0, img.width, img.height)
-                                bmp.recycle()
-                                c
-                            } else bmp
+                            // Allocate / reallocate bitmaps lazily — they
+                            // only change if the device's display geometry
+                            // changes mid-cast, which is rare.
+                            if (paddedBitmap == null ||
+                                lastPaddedWidth != paddedWidth ||
+                                paddedBitmap?.height != img.height
+                            ) {
+                                paddedBitmap?.recycle()
+                                paddedBitmap = Bitmap.createBitmap(
+                                    paddedWidth, img.height, Bitmap.Config.ARGB_8888,
+                                )
+                                lastPaddedWidth = paddedWidth
+                                croppedBitmap?.recycle()
+                                croppedBitmap = if (paddedWidth != img.width) {
+                                    Bitmap.createBitmap(
+                                        img.width, img.height, Bitmap.Config.ARGB_8888,
+                                    )
+                                } else null
+                            }
 
-                            val baos = ByteArrayOutputStream(64 * 1024)
-                            cropped.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
-                            cropped.recycle()
-                            ScreenCast.publishFrame(baos.toByteArray(), img.width, img.height)
+                            val padded = paddedBitmap!!
+                            padded.copyPixelsFromBuffer(plane.buffer)
+
+                            val source = if (croppedBitmap != null) {
+                                // Manual pixel copy is faster than
+                                // Bitmap.createBitmap-with-crop because
+                                // the latter always allocates.
+                                val pixels = IntArray(img.width * img.height)
+                                padded.getPixels(
+                                    pixels, 0, img.width,
+                                    0, 0, img.width, img.height,
+                                )
+                                croppedBitmap!!.setPixels(
+                                    pixels, 0, img.width,
+                                    0, 0, img.width, img.height,
+                                )
+                                croppedBitmap!!
+                            } else padded
+
+                            // Publish to encoder. If a frame is already
+                            // queued, drop it (we'll catch up next tick).
+                            if (pendingFrame.compareAndSet(null, source)) {
+                                frameReady.release()
+                            } else {
+                                pendingFrame.set(source)
+                                // Don't release — semaphore is already >0
+                            }
                         } finally {
                             img.close()
                         }
@@ -163,20 +248,13 @@ class ScreenCastService : Service() {
                     val sleep = frameIntervalMs - elapsed
                     if (sleep > 0) Thread.sleep(sleep)
                 }
-            } catch (_: InterruptedException) {
-                // Normal shutdown path
-            } catch (_: Throwable) {
-                // Don't let the capture thread kill the process; just stop.
-                stopSelfSafely()
-            }
-        }, "wifishare-screencast").apply {
-            isDaemon = true
-            start()
-        }
+            } catch (_: InterruptedException) { /* normal */ }
+            catch (_: Throwable) { stopSelfSafely() }
+        }, "wifishare-capture").apply { isDaemon = true; start() }
     }
 
     @Suppress("DEPRECATION")
-    private fun computeMetrics(): Triple<Int, Int, Int> {
+    private fun computeMetrics(maxEdge: Int): Triple<Int, Int, Int> {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val density: Int
         val w: Int
@@ -194,10 +272,10 @@ class ScreenCastService : Service() {
             h = dm.heightPixels
             density = dm.densityDpi
         }
-        // Scale down so we never push huge frames over WiFi — capping the
-        // long edge at 1280 keeps bandwidth manageable on a phone hotspot
-        // and the JPEG-compress CPU cost in check.
-        val maxEdge = 1280
+        // Scale down so we never push huge frames over WiFi — bandwidth +
+        // JPEG-compress CPU cost grow with pixel count. The cap comes
+        // from the active ScreenCast.Mode (Quality 1280 / Balanced 1024
+        // / Smooth 768).
         val long = maxOf(w, h)
         return if (long > maxEdge) {
             val scale = maxEdge.toFloat() / long
@@ -214,6 +292,18 @@ class ScreenCastService : Service() {
     private fun stopSelfSafely() {
         try { captureThread?.interrupt() } catch (_: Throwable) {}
         captureThread = null
+        try { encoderThread?.interrupt() } catch (_: Throwable) {}
+        encoderThread = null
+        // Drain semaphore so a lingering acquire in the encoder doesn't
+        // deadlock past the interrupt() — interrupt() should be enough,
+        // but cheap belt + suspenders.
+        try { frameReady.release() } catch (_: Throwable) {}
+        pendingFrame.set(null)
+        try { paddedBitmap?.recycle() } catch (_: Throwable) {}
+        paddedBitmap = null
+        try { croppedBitmap?.recycle() } catch (_: Throwable) {}
+        croppedBitmap = null
+        lastPaddedWidth = 0
         try { virtualDisplay?.release() } catch (_: Throwable) {}
         virtualDisplay = null
         try { imageReader?.close() } catch (_: Throwable) {}
@@ -280,13 +370,20 @@ class ScreenCastService : Service() {
         private const val ACTION_STOP = "com.wifishare.screen.STOP"
         private const val EXTRA_RESULT_CODE = "resultCode"
         private const val EXTRA_RESULT_DATA = "resultData"
+        private const val EXTRA_MODE = "mode"
         private const val NOTIF_ID = 2002
 
-        fun start(context: Context, resultCode: Int, data: Intent) {
+        fun start(
+            context: Context,
+            resultCode: Int,
+            data: Intent,
+            mode: ScreenCast.Mode = ScreenCast.Mode.Balanced,
+        ) {
             val intent = Intent(context, ScreenCastService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_RESULT_DATA, data)
+                putExtra(EXTRA_MODE, mode.name)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)

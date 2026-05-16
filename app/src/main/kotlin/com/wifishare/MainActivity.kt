@@ -11,6 +11,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import com.wifishare.screen.ScreenCast
 import com.wifishare.screen.ScreenCastService
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -54,15 +55,19 @@ class MainActivity : ComponentActivity() {
      * Cancel" dialog; on accept we hand the result Intent to the screen
      * cast service, which uses it to spawn the projection.
      */
+    @Volatile
+    private var pendingCastMode: ScreenCast.Mode = ScreenCast.Mode.Balanced
+
     private val mediaProjectionPermission = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            ScreenCastService.start(this, result.resultCode, result.data!!)
+            ScreenCastService.start(this, result.resultCode, result.data!!, pendingCastMode)
         }
     }
 
-    fun requestScreenCast() {
+    fun requestScreenCast(mode: ScreenCast.Mode = ScreenCast.Mode.Balanced) {
+        pendingCastMode = mode
         val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjectionPermission.launch(mgr.createScreenCaptureIntent())
     }

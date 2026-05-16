@@ -17,6 +17,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -25,6 +26,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -146,25 +149,86 @@ fun HomeScreen(
         // served via the same HTTP endpoint.
         val castState by ScreenCast.state.collectAsState()
         val castRunning = castState == ScreenCast.State.Running
+        val castMode by ScreenCast.mode.collectAsState()
         val ctx = LocalContext.current
+
         OutlinedButton(
             onClick = {
                 val act = (ctx as? MainActivity) ?: return@OutlinedButton
-                if (castRunning) act.stopScreenCast() else act.requestScreenCast()
+                if (castRunning) act.stopScreenCast() else act.requestScreenCast(castMode)
             },
             enabled = serverState is ServerService.State.Running,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(if (castRunning) "Stop screen cast" else "Cast screen to browser")
         }
+
+        // Mode chips — pick before starting, or switch during cast (the
+        // tap will stop+restart the cast with the new mode).
+        ScreenCastModeChips(
+            selected = castMode,
+            castRunning = castRunning,
+            onSelect = { mode ->
+                ScreenCast.setMode(mode)
+                val act = ctx as? MainActivity ?: return@ScreenCastModeChips
+                if (castRunning) {
+                    // Restart with new mode — the system MediaProjection
+                    // permission is one-shot, so we need to re-prompt the
+                    // user. They probably expect that anyway.
+                    act.stopScreenCast()
+                    act.requestScreenCast(mode)
+                }
+            },
+        )
+
         if (castRunning && serverState is ServerService.State.Running) {
             val running = serverState as ServerService.State.Running
+            // recompose every second so measuredFps stays live
+            val fpsTick by produceState(0L) {
+                while (true) { value = System.currentTimeMillis(); kotlinx.coroutines.delay(1000) }
+            }
+            val fps = remember(fpsTick) { ScreenCast.measuredFps }
             Text(
-                "Open ${running.url}/screen in any browser on the LAN.",
+                "Open ${running.url}/screen in any browser on the LAN. " +
+                    if (fps > 0) "Now: %.1f fps · ${castMode.label} · ${castMode.longEdge}px".format(fps)
+                    else "Encoding…",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+}
+
+@Composable
+private fun ScreenCastModeChips(
+    selected: ScreenCast.Mode,
+    castRunning: Boolean,
+    onSelect: (ScreenCast.Mode) -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        ScreenCast.Mode.entries.forEach { mode ->
+            FilterChip(
+                selected = selected == mode,
+                onClick = { onSelect(mode) },
+                label = {
+                    Text(
+                        "${mode.label} · ${mode.targetFps} fps",
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                },
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+    if (castRunning) {
+        Text(
+            "Switching mode restarts the cast — Android will ask for permission again.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

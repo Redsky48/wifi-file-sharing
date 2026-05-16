@@ -93,6 +93,10 @@ class FileServer(
                 path == "/api/info" ||
                 path.startsWith("/static/") ||
                 path.startsWith("/download/")
+            // Note: /screen and /api/screen.* require auth. Browser users
+            // who hit /screen directly will see a 401 — the canonical
+            // viewer is the tray's built-in WinForms window which already
+            // holds the PIN. See ScreenStreamForm.cs.
 
             if (!isPublic && !isAuthorized(session)) {
                 return unauthorized(rawPath)
@@ -982,6 +986,8 @@ class FileServer(
             .put("frameCount", ScreenCast.frameCount)
             .put("width", ScreenCast.width)
             .put("height", ScreenCast.height)
+            .put("fps", ScreenCast.measuredFps)
+            .put("mode", ScreenCast.mode.value.name)
             .put("note", "GET /api/screen for MJPEG stream, /api/screen.jpg for single frame, /screen for viewer page")
         return json(Response.Status.OK, out.toString())
     }

@@ -23,8 +23,34 @@ object ScreenCast {
 
     enum class State { Stopped, Running }
 
+    /**
+     * Quality/throughput presets. Tuned for LAN-only use over a phone
+     * hotspot or WiFi — bigger numbers chew more CPU on the phone, more
+     * bandwidth on the wire, and lower fps on the viewer.
+     */
+    enum class Mode(
+        val label: String,
+        val longEdge: Int,
+        val targetFps: Int,
+        val jpegQuality: Int,
+    ) {
+        Quality("Quality", 1280, 18, 72),       // sharper text, slower fps
+        Balanced("Balanced", 1024, 24, 62),     // default — readable + responsive
+        Smooth("Smooth", 768, 32, 55),          // fps-first, softer image
+    }
+
     private val _state = MutableStateFlow(State.Stopped)
     val state: StateFlow<State> = _state.asStateFlow()
+
+    private val _mode = MutableStateFlow(Mode.Balanced)
+    val mode: StateFlow<Mode> = _mode.asStateFlow()
+
+    internal fun setMode(m: Mode) { _mode.value = m }
+
+    @Volatile
+    var measuredFps: Float = 0f
+        private set
+    internal fun setMeasuredFps(v: Float) { measuredFps = v }
 
     @Volatile
     private var _latestJpeg: ByteArray? = null
@@ -73,6 +99,7 @@ object ScreenCast {
             frameCount = 0
             width = 0
             height = 0
+            measuredFps = 0f
         }
     }
 }

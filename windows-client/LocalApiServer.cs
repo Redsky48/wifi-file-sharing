@@ -29,7 +29,9 @@ public sealed record StatusSnapshot(
     string? MountedDrive,
     bool WinFspInstalled,
     string DeviceName,
-    string Version);
+    string Version,
+    bool PhoneIsCasting,
+    string? PhoneScreenViewerUrl);
 
 /// <summary>
 /// Loopback-only HTTP API on 127.0.0.1 so AI agents / shell scripts on
@@ -438,6 +440,7 @@ a{{color:#06c}}</style></head>
 <div>WinFSP installed</div><div>{s.WinFspInstalled}</div>
 <div>Device name</div><div>{HtmlEncode(s.DeviceName)}</div>
 <div>Version</div><div>{HtmlEncode(s.Version)}</div>
+<div>Phone is casting</div><div>{s.PhoneIsCasting}{(s.PhoneIsCasting && s.PhoneScreenViewerUrl != null ? $@" — <a href=""{HtmlEncode(s.PhoneScreenViewerUrl)}"" target=""_blank"">open viewer</a>" : "")}</div>
 </div>
 <p><a href=""/docs""><b>→ Full API documentation</b></a> · machine-readable manifest at <a href=""/api/manifest""><code>/api/manifest</code></a></p>
 <h2>Endpoints</h2>
@@ -491,6 +494,8 @@ a{{color:#06c}}</style></head>
                         WinFspInstalled = true,
                         DeviceName = "DESKTOP-XYZ",
                         Version = "0.7.0.0",
+                        PhoneIsCasting = true,
+                        PhoneScreenViewerUrl = "http://10.131.141.87:8080/screen",
                     },
                 },
                 new
