@@ -50,6 +50,14 @@ public sealed class MdnsBrowser : IDisposable
         {
             // Resolve SRV + A records
             var name = e.ServiceInstanceName.ToString();
+            // Makaretu fires this event for *every* SRV record it observes,
+            // not just instances of the service type we queried. Filter
+            // strictly to our type — otherwise LG webOS TVs, Chromecasts,
+            // network printers, and every other mDNS device shows up in
+            // the "Devices" list. Their endpoints don't speak our REST
+            // protocol, so clicking would just fail.
+            if (!name.Contains(ServiceType, StringComparison.OrdinalIgnoreCase)) return;
+
             var msg = e.Message;
             var srv = msg.AdditionalRecords.OfType<SRVRecord>().FirstOrDefault()
                       ?? msg.Answers.OfType<SRVRecord>().FirstOrDefault();

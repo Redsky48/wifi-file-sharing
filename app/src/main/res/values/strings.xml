@@ -12,4 +12,6 @@
     <string name="screencast_notification_title">Casting screen</string>
     <string name="screencast_notification_text">Phone screen is streaming to browser viewers (video only).</string>
     <string name="screencast_stop">Stop</string>
+    <string name="remote_input_a11y_description">Lets your paired PC inject taps, swipes, and the Back/Home/Recents buttons while you\'re casting your screen. Coordinates come from the WiFi Share local network only — no remote access.</string>
+    <string name="remote_input_a11y_summary">Remote PC clicks while screen cast is live</string>
 </resources>

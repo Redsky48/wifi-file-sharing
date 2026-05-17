@@ -50,6 +50,7 @@ class ScreenCastService : Service() {
     private var imageReader: ImageReader? = null
     private var captureThread: Thread? = null
     private var encoderThread: Thread? = null
+    private var h264: H264Encoder? = null
 
     // Display metrics captured at start so rotations don't crash us mid-cast.
     private var captureWidth = 0
@@ -118,26 +119,64 @@ class ScreenCastService : Service() {
             }
         }, null)
 
-        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-        imageReader = reader
+        if (activeMode.isH264) {
+            val enc = try {
+                H264Encoder(
+                    width = w,
+                    height = h,
+                    frameRate = activeMode.targetFps,
+                    bitrateBps = activeMode.bitrateKbps * 1000,
+                )
+            } catch (t: Throwable) {
+                // Hardware encoder may reject the config (rare device,
+                // OEM quirks). Tell the user and back out gracefully
+                // instead of leaving the projection half-set-up.
+                PhoneEvents.push("screen.error",
+                    mapOf("reason" to "h264_init_failed",
+                          "message" to (t.message ?: t.javaClass.simpleName)))
+                stopSelfSafely()
+                return
+            }
+            h264 = enc
+            // ORDER MATTERS: codec must be started before any frames
+            // arrive on its input surface. Some OEM encoders crash with
+            // IllegalStateException if the VirtualDisplay starts pushing
+            // frames before MediaCodec.start().
+            enc.start()
+            virtualDisplay = proj.createVirtualDisplay(
+                "WiFiShareScreenCast",
+                w, h, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                enc.inputSurface,
+                null,
+                null,
+            )
+            ScreenCast.setRunning(true)
+            PhoneEvents.push("screen.started",
+                mapOf("width" to w, "height" to h, "codec" to "h264"))
+        } else {
+            val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+            imageReader = reader
 
-        virtualDisplay = proj.createVirtualDisplay(
-            "WiFiShareScreenCast",
-            w, h, density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader.surface,
-            null,
-            null,
-        )
+            virtualDisplay = proj.createVirtualDisplay(
+                "WiFiShareScreenCast",
+                w, h, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.surface,
+                null,
+                null,
+            )
 
-        ScreenCast.setRunning(true)
-        PhoneEvents.push("screen.started", mapOf("width" to w, "height" to h))
+            ScreenCast.setRunning(true)
+            PhoneEvents.push("screen.started",
+                mapOf("width" to w, "height" to h, "codec" to "mjpeg"))
 
-        // We grab frames on a dedicated thread instead of using
-        // ImageReader.OnImageAvailableListener — the listener fires per
-        // V-sync which is way more than we need (and the CPU cost of
-        // compressing every frame to JPEG would blow up).
-        startCaptureLoop(reader)
+            // We grab frames on a dedicated thread instead of using
+            // ImageReader.OnImageAvailableListener — the listener fires per
+            // V-sync which is way more than we need (and the CPU cost of
+            // compressing every frame to JPEG would blow up).
+            startCaptureLoop(reader)
+        }
     }
 
     private fun startCaptureLoop(reader: ImageReader) {
@@ -294,6 +333,8 @@ class ScreenCastService : Service() {
         captureThread = null
         try { encoderThread?.interrupt() } catch (_: Throwable) {}
         encoderThread = null
+        try { h264?.stop() } catch (_: Throwable) {}
+        h264 = null
         // Drain semaphore so a lingering acquire in the encoder doesn't
         // deadlock past the interrupt() — interrupt() should be enough,
         // but cheap belt + suspenders.

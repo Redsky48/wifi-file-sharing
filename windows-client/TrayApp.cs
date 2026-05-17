@@ -29,6 +29,13 @@ public sealed class TrayApp : IDisposable
     private readonly ToolStripMenuItem _exitItem;
     private readonly ToolStripMenuItem _apiDocsItem;
     private readonly ToolStripMenuItem _viewScreenItem;
+    private readonly ToolStripMenuItem _clipboardMenu;
+    private readonly ToolStripMenuItem _clipboardSyncToggle;
+    private readonly ToolStripMenuItem _pushClipboardItem;
+    private readonly ToolStripMenuItem _pullClipboardItem;
+    private string? _lastPhoneClipboard;
+    private string? _lastMirroredClipboard;
+    private readonly ToolStripMenuItem _castToTvMenu;
 
     private readonly Settings _settings = Settings.Load();
     private readonly MdnsBrowser _browser;
@@ -39,6 +46,9 @@ public sealed class TrayApp : IDisposable
     private readonly PendingUploads _pending = new();
     private readonly LocalApiServer _localApi;
     private readonly PhoneEventSubscriber _phoneEvents;
+    private readonly SsdpBrowser _ssdp = new();
+    private readonly CastMediaServer _castServer = new();
+    private readonly ClipboardWatcher _clipboardWatcher = new();
     private bool _phoneCasting;
     private readonly SynchronizationContext _ui;
     private readonly ToolStripMenuItem _settingsItem;
@@ -48,6 +58,7 @@ public sealed class TrayApp : IDisposable
     private AppState _state = AppState.Scanning;
     private DiscoveredService? _connectedTo;
     private string? _connectedPassword; // held in-memory only; persisted DPAPI-encrypted in Settings
+    private string? _connectedToken;    // Bearer token, preferred over PIN once paired
     private bool _autoConnect;
     private ScreenStreamForm? _screenForm;
 
@@ -162,6 +173,38 @@ public sealed class TrayApp : IDisposable
             Visible = false, // shown only while phone is casting
         };
 
+        _clipboardSyncToggle = new ToolStripMenuItem("Auto-mirror phone → PC")
+        {
+            CheckOnClick = true,
+            Checked = _settings.ClipboardAutoMirror,
+        };
+        _clipboardSyncToggle.CheckedChanged += (_, _) =>
+        {
+            _settings.ClipboardAutoMirror = _clipboardSyncToggle.Checked;
+            _settings.Save();
+        };
+        _pushClipboardItem = new ToolStripMenuItem(
+            "Push PC clipboard → phone",
+            null,
+            (_, _) => PushClipboardToPhone());
+        _pullClipboardItem = new ToolStripMenuItem(
+            "Pull phone clipboard → PC",
+            null,
+            async (_, _) => await PullClipboardFromPhoneAsync());
+        _clipboardMenu = new ToolStripMenuItem("Clipboard");
+        _clipboardMenu.DropDownItems.AddRange(new ToolStripItem[]
+        {
+            _clipboardSyncToggle,
+            new ToolStripSeparator(),
+            _pushClipboardItem,
+            _pullClipboardItem,
+        });
+
+        _castToTvMenu = new ToolStripMenuItem("Cast to TV")
+        {
+            Visible = false, // shown only when at least one DLNA renderer is discovered
+        };
+
         _menu = new ContextMenuStrip();
         _menu.Items.AddRange(new ToolStripItem[]
         {
@@ -175,6 +218,8 @@ public sealed class TrayApp : IDisposable
             _openItem,
             _openWebItem,
             _viewScreenItem,
+            _clipboardMenu,
+            _castToTvMenu,
             _disconnectItem,
             new ToolStripSeparator(),
             _autoConnectItem,
@@ -254,6 +299,20 @@ public sealed class TrayApp : IDisposable
             // AI agents is unavailable — but don't block the tray itself.
             Post(() => ShowBalloon("Local API unavailable", _localApi.StartupError!));
         }
+
+        // SSDP browsing + local media host for DLNA "Cast to TV". Both
+        // are passive — no extra cost until the user discovers a TV and
+        // clicks the cast item.
+        _ssdp.Found += r => Post(() => OnDlnaRendererFound(r));
+        _ssdp.Start();
+        _castServer.Start();
+
+        // PC → phone clipboard sync. Watcher fires for every clipboard
+        // change (any app). We only push if AutoMirror is enabled and a
+        // phone is currently paired. _lastMirroredClipboard double-duty
+        // prevents the loop where: phone pushes → we paste into Windows
+        // clipboard → watcher fires → we'd push it right back.
+        _clipboardWatcher.ClipboardChanged += () => Post(OnPcClipboardChanged);
 
         Application.ApplicationExit += (_, _) => Cleanup();
     }
@@ -632,9 +691,14 @@ public sealed class TrayApp : IDisposable
         _state = AppState.Connected;
         UpdateUi();
         _connectedPassword = savedPassword;
-        _health.Start(svc.Url, savedPassword);
-        _queue.Start(svc.Url, savedPassword);
-        _phoneEvents.Start(svc.Url, savedPassword);
+        // Try to upgrade to a Bearer token. If we already have one for
+        // this phone, just use it. Otherwise, do a one-shot /api/auth/pair
+        // call using the PIN we just verified. Falls back to PIN-only if
+        // pairing fails (e.g. older phone build without the endpoint).
+        _connectedToken = await EnsurePairedTokenAsync(svc, savedPassword);
+        _health.Start(svc.Url, savedPassword, _connectedToken);
+        _queue.Start(svc.Url, savedPassword, _connectedToken);
+        _phoneEvents.Start(svc.Url, savedPassword, _connectedToken);
 
         var backendName = result.Kind == MountKind.WinFsp ? "WinFSP" : "WebDAV";
         ShowBalloon(
@@ -683,6 +747,7 @@ public sealed class TrayApp : IDisposable
         _queue.Stop();
         _phoneEvents.Stop();
         _connectedPassword = null;
+        _connectedToken = null;
         if (_phoneCasting)
         {
             _phoneCasting = false;
@@ -751,6 +816,14 @@ public sealed class TrayApp : IDisposable
                     try { _screenForm.NotifyRemoteStopped(); } catch { }
                 }
                 break;
+            case "clipboard.changed":
+                if (_settings.ClipboardAutoMirror)
+                {
+                    // Fetch the actual full text asynchronously — the
+                    // event only carries a preview to keep frames small.
+                    _ = MirrorPhoneClipboardAsync();
+                }
+                break;
             // Other events flow through to /api/events on the tray side
             // already (via re-emission below) — agents can subscribe
             // there for everything.
@@ -793,11 +866,288 @@ public sealed class TrayApp : IDisposable
             catch { _screenForm = null; }
         }
 
-        var form = new ScreenStreamForm(baseUrl, _connectedPassword);
+        var form = new ScreenStreamForm(baseUrl, _connectedPassword, _connectedToken);
         form.FormClosed += (_, _) => _screenForm = null;
         _screenForm = form;
         form.Show();
     }
+
+    /// <summary>
+    /// Returns a Bearer token for this phone, minting one if we don't
+    /// already have it. The cached path uses Settings.KnownDeviceTokens
+    /// (DPAPI-encrypted); cache misses fall through to POST /api/auth/pair
+    /// with Basic auth. If pairing fails for any reason we return null
+    /// and the caller falls back to PIN-only.
+    /// </summary>
+    private async System.Threading.Tasks.Task<string?> EnsurePairedTokenAsync(
+        DiscoveredService svc, string? pin)
+    {
+        var key = svc.Name; // stable per-phone identifier
+        if (_settings.KnownDeviceTokens.TryGetValue(key, out var encrypted))
+        {
+            var existing = DecryptToken(encrypted);
+            if (!string.IsNullOrEmpty(existing))
+            {
+                // Quick probe to make sure the token still works — if it
+                // doesn't (revoked from the phone), drop the cache and
+                // re-pair below.
+                if (await TokenIsValidAsync(svc.Url, existing))
+                {
+                    return existing;
+                }
+                _settings.KnownDeviceTokens.Remove(key);
+                _settings.Save();
+            }
+        }
+
+        if (string.IsNullOrEmpty(pin)) return null; // can't pair without PIN
+
+        try
+        {
+            using var http = AuthHttp.Build(new Uri(svc.Url), pin, TimeSpan.FromSeconds(8));
+            var body = new System.Net.Http.StringContent(
+                $"{{\"name\":\"{System.Net.WebUtility.UrlEncode(_settings.DeviceName)}\"}}",
+                System.Text.Encoding.UTF8, "application/json");
+            using var resp = await http.PostAsync("/api/auth/pair", body);
+            if (!resp.IsSuccessStatusCode) return null;
+            var text = await resp.Content.ReadAsStringAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(text);
+            var token = doc.RootElement.TryGetProperty("token", out var t) ? t.GetString() : null;
+            if (string.IsNullOrEmpty(token)) return null;
+            _settings.KnownDeviceTokens[key] = EncryptToken(token);
+            _settings.Save();
+            return token;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static async System.Threading.Tasks.Task<bool> TokenIsValidAsync(
+        string baseUrl, string token)
+    {
+        try
+        {
+            using var http = AuthHttp.Build(new Uri(baseUrl), null,
+                TimeSpan.FromSeconds(4), token);
+            using var resp = await http.GetAsync("/api/info");
+            // /api/info is public, so we use /api/files to actually
+            // exercise the auth path.
+            using var resp2 = await http.GetAsync("/api/files");
+            return resp2.IsSuccessStatusCode;
+        }
+        catch { return false; }
+    }
+
+    private static string EncryptToken(string token)
+    {
+        var bytes = System.Text.Encoding.UTF8.GetBytes(token);
+        var enc = System.Security.Cryptography.ProtectedData.Protect(
+            bytes, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+        return Convert.ToBase64String(enc);
+    }
+
+    private static string DecryptToken(string encrypted)
+    {
+        try
+        {
+            var bytes = Convert.FromBase64String(encrypted);
+            var dec = System.Security.Cryptography.ProtectedData.Unprotect(
+                bytes, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+            return System.Text.Encoding.UTF8.GetString(dec);
+        }
+        catch { return ""; }
+    }
+
+    /// <summary>
+    /// Win32 told us the Windows clipboard changed. Decide whether to
+    /// push it to the phone — only when AutoMirror is on, a phone is
+    /// paired, the new text isn't what we just pasted from the phone
+    /// (avoids feedback loop), and the change is text (not files /
+    /// images, which the phone-side string clipboard wouldn't accept).
+    /// </summary>
+    private void OnPcClipboardChanged()
+    {
+        if (!_settings.ClipboardAutoMirror) return;
+        var baseUrl = _connectedTo?.Url;
+        if (string.IsNullOrEmpty(baseUrl)) return;
+
+        string text;
+        try
+        {
+            if (!Clipboard.ContainsText()) return;
+            text = Clipboard.GetText() ?? "";
+        }
+        catch { return; /* clipboard busy — try again next change */ }
+        if (string.IsNullOrEmpty(text)) return;
+        // Loop guard — _lastMirroredClipboard is set both when WE paste
+        // (mirroring from phone) and when WE push (mirroring to phone).
+        if (text == _lastMirroredClipboard) return;
+        _lastMirroredClipboard = text;
+        _ = PushClipboardAsync(baseUrl, text, silent: true);
+    }
+
+    private async System.Threading.Tasks.Task MirrorPhoneClipboardAsync()
+    {
+        var baseUrl = _connectedTo?.Url;
+        if (string.IsNullOrEmpty(baseUrl)) return;
+        try
+        {
+            using var http = AuthHttp.Build(new Uri(baseUrl), _connectedPassword, TimeSpan.FromSeconds(10), _connectedToken);
+            using var resp = await http.GetAsync("/api/clipboard");
+            if (!resp.IsSuccessStatusCode) return;
+            var body = await resp.Content.ReadAsStringAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            var text = doc.RootElement.TryGetProperty("text", out var t) ? t.GetString() : null;
+            if (string.IsNullOrEmpty(text)) return;
+            if (text == _lastMirroredClipboard) return; // already pasted this one
+            _lastPhoneClipboard = text;
+            _lastMirroredClipboard = text;
+            Post(() =>
+            {
+                try
+                {
+                    Clipboard.SetText(text);
+                    ShowBalloon("Clipboard synced from phone",
+                        text.Length > 80 ? text.Substring(0, 80) + "…" : text);
+                }
+                catch { /* clipboard busy — ignore */ }
+            });
+        }
+        catch { /* phone went away — silent */ }
+    }
+
+    private async System.Threading.Tasks.Task PullClipboardFromPhoneAsync()
+    {
+        await MirrorPhoneClipboardAsync();
+    }
+
+    private void PushClipboardToPhone()
+    {
+        var baseUrl = _connectedTo?.Url;
+        if (string.IsNullOrEmpty(baseUrl))
+        {
+            ShowBalloon("Push clipboard", "Not connected to a phone right now.");
+            return;
+        }
+        string text;
+        try { text = Clipboard.GetText() ?? ""; }
+        catch { text = ""; }
+        if (string.IsNullOrEmpty(text))
+        {
+            ShowBalloon("Push clipboard", "PC clipboard is empty (or contains non-text data).");
+            return;
+        }
+        _ = PushClipboardAsync(baseUrl, text);
+    }
+
+    private async System.Threading.Tasks.Task PushClipboardAsync(
+        string baseUrl, string text, bool silent = false)
+    {
+        try
+        {
+            using var http = AuthHttp.Build(new Uri(baseUrl), _connectedPassword, TimeSpan.FromSeconds(10), _connectedToken);
+            var content = new System.Net.Http.StringContent(
+                text, System.Text.Encoding.UTF8, "text/plain");
+            using var resp = await http.PutAsync("/api/clipboard", content);
+            if (resp.IsSuccessStatusCode)
+            {
+                _lastMirroredClipboard = text; // suppress echo-back from event
+                if (!silent)
+                {
+                    Post(() => ShowBalloon("Sent to phone",
+                        text.Length > 80 ? text.Substring(0, 80) + "…" : text));
+                }
+            }
+            else if (!silent)
+            {
+                Post(() => ShowBalloon("Push clipboard failed", $"HTTP {(int)resp.StatusCode}"));
+            }
+        }
+        catch (Exception ex)
+        {
+            if (!silent) Post(() => ShowBalloon("Push clipboard failed", ex.Message));
+        }
+    }
+
+    // ── DLNA "Cast to TV" ──────────────────────────────────────────
+
+    private void OnDlnaRendererFound(DlnaRenderer renderer)
+    {
+        // Skip duplicates — TVs answer M-SEARCH bursts multiple times.
+        foreach (ToolStripItem existing in _castToTvMenu.DropDownItems)
+        {
+            if (existing.Tag is DlnaRenderer r && r.Udn == renderer.Udn) return;
+        }
+
+        var sub = new ToolStripMenuItem(renderer.FriendlyName) { Tag = renderer };
+        var castFile = new ToolStripMenuItem("Cast a video / photo from PC…",
+            null, (_, _) => CastFileFromPc(renderer));
+        var stop = new ToolStripMenuItem("Stop playback",
+            null, async (_, _) => await DlnaClient.StopAsync(renderer));
+        sub.DropDownItems.Add(castFile);
+        sub.DropDownItems.Add(new ToolStripSeparator());
+        sub.DropDownItems.Add(stop);
+        _castToTvMenu.DropDownItems.Add(sub);
+        _castToTvMenu.Visible = true;
+    }
+
+    private void CastFileFromPc(DlnaRenderer renderer)
+    {
+        using var dlg = new OpenFileDialog
+        {
+            Title = $"Cast to {renderer.FriendlyName}",
+            Filter = "Media files|*.mp4;*.mkv;*.webm;*.mov;*.avi;*.jpg;*.jpeg;*.png;*.gif;*.webp;*.mp3;*.m4a;*.aac;*.flac;*.ogg|All files|*.*",
+            CheckFileExists = true,
+        };
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+        _ = CastFileAsync(renderer, dlg.FileName);
+    }
+
+    private async System.Threading.Tasks.Task CastFileAsync(DlnaRenderer renderer, string filePath)
+    {
+        var url = _castServer.RegisterFile(filePath);
+        if (url == null)
+        {
+            ShowBalloon("Cast failed", "Local media server isn't running — try restarting the tray.");
+            return;
+        }
+        var mime = MimeFromExt(System.IO.Path.GetExtension(filePath));
+        var setOk = await DlnaClient.SetUriAsync(renderer, url, mime,
+            System.IO.Path.GetFileName(filePath));
+        if (!setOk)
+        {
+            ShowBalloon("Cast failed", $"{renderer.FriendlyName} rejected SetAVTransportURI.");
+            return;
+        }
+        var playOk = await DlnaClient.PlayAsync(renderer);
+        if (!playOk)
+        {
+            ShowBalloon("Cast failed", $"{renderer.FriendlyName} accepted the URL but won't play it.");
+            return;
+        }
+        ShowBalloon($"Casting to {renderer.FriendlyName}",
+            System.IO.Path.GetFileName(filePath));
+    }
+
+    private static string MimeFromExt(string ext) => ext.ToLowerInvariant() switch
+    {
+        ".mp4" => "video/mp4",
+        ".mkv" => "video/x-matroska",
+        ".webm" => "video/webm",
+        ".mov" => "video/quicktime",
+        ".avi" => "video/x-msvideo",
+        ".jpg" or ".jpeg" => "image/jpeg",
+        ".png" => "image/png",
+        ".gif" => "image/gif",
+        ".webp" => "image/webp",
+        ".mp3" => "audio/mpeg",
+        ".m4a" or ".aac" => "audio/aac",
+        ".flac" => "audio/flac",
+        ".ogg" => "audio/ogg",
+        _ => "application/octet-stream",
+    };
 
     private void OpenLocalApiDocs()
     {
@@ -1142,6 +1492,9 @@ public sealed class TrayApp : IDisposable
         try { _phoneEvents.Dispose(); } catch { }
         try { _ipc.Stop(); } catch { }
         try { _localApi.Dispose(); } catch { }
+        try { _ssdp.Dispose(); } catch { }
+        try { _castServer.Dispose(); } catch { }
+        try { _clipboardWatcher.Dispose(); } catch { }
         try { _ = _mounter.UnmountAsync(); } catch { }
         try { _tray.Visible = false; } catch { }
     }

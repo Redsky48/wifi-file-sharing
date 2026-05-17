@@ -15,7 +15,9 @@
       "Bash(curl -sS http://127.0.0.1:9099/docs)",
       "Bash(timeout 5 curl -sS -N http://127.0.0.1:9099/api/events)",
       "Bash(PHONE_HOST=http://10.131.141.87:8080 PHONE_PIN=484848 bash build.sh)",
-      "Bash(./gradlew.bat assembleDebug --quiet)"
+      "Bash(./gradlew.bat assembleDebug --quiet)",
+      "Bash(\"/c/Program Files/dotnet/dotnet.exe\" build windows-client/WiFiShareTray.csproj -c Release --nologo --verbosity quiet)",
+      "Bash(unzip -l \"app/build/outputs/apk/debug/WiFiShare-0.12.0-debug-v12.apk\")"
     ]
   }
 }

@@ -16,8 +16,8 @@
   button { background: #2a2a32; color: inherit; border: 1px solid #3a3a44; padding: 6px 12px; border-radius: 4px; cursor: pointer; font: inherit; }
   button:hover { background: #34343e; }
   main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 12px; }
-  #stage { max-width: 100%; max-height: calc(100vh - 80px); display: block; box-shadow: 0 0 0 1px #2a2a32; background: #0a0a0c; }
-  #stage.off { display: none; }
+  #stage, #stageCanvas { max-width: 100%; max-height: calc(100vh - 80px); display: block; box-shadow: 0 0 0 1px #2a2a32; background: #0a0a0c; }
+  #stage.off, #stageCanvas.off { display: none; }
   #offline { color: #888; text-align: center; max-width: 360px; }
   #offline h2 { color: #aaa; font-weight: 600; margin: 0 0 8px; }
   #offline p { margin: 4px 0; font-size: 14px; line-height: 1.5; }
@@ -32,7 +32,8 @@
   <button id="fs">Fullscreen</button>
 </header>
 <main>
-  <img id="stage" alt="Phone screen">
+  <canvas id="stageCanvas" class="off"></canvas>
+  <img id="stage" alt="Phone screen" class="off">
   <div id="offline" style="display:none">
     <h2>Screen cast is off</h2>
     <p>Open the WiFi Share app on the phone and tap <b>Cast screen</b>. The page will auto-refresh.</p>
@@ -42,79 +43,271 @@
 <footer>
   <span id="dims">—</span>
   <span id="fps">— fps</span>
+  <span id="codec">—</span>
   <span style="flex:1"></span>
   <span>Video only · no audio</span>
 </footer>
 <script>
   const stage = document.getElementById('stage');
+  const canvas = document.getElementById('stageCanvas');
   const status = document.getElementById('status');
   const offline = document.getElementById('offline');
   const dims = document.getElementById('dims');
   const fpsEl = document.getElementById('fps');
+  const codecEl = document.getElementById('codec');
   const fsBtn = document.getElementById('fs');
 
-  let frames = 0, lastFpsTick = performance.now(), running = false;
+  let mode = null;             // 'h264' | 'mjpeg' | null
+  let desiredMode = null;      // what phone says it's serving
+  let h264Conn = null;
+  let h264Connecting = false;
+  let mjpegRunning = false;
+  let frames = 0;
+  let lastFpsTick = performance.now();
 
+  // ── H.264 path (WebCodecs) ────────────────────────────────────────
+  async function startH264() {
+    if (!('VideoDecoder' in window)) {
+      // Browser too old — fall back to MJPEG. Phone needs to be in
+      // an MJPEG mode for this to actually work; status polling will
+      // surface the mismatch if the phone is still H.264.
+      return startMjpeg('webcodecs-missing');
+    }
+    if (h264Conn || h264Connecting) return;
+    h264Connecting = true;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${location.host}/ws/screen`);
+    ws.binaryType = 'arraybuffer';
+    let decoder = null;
+    let helloReceived = false;
+    const ctx = canvas.getContext('2d');
+
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        try {
+          const j = JSON.parse(ev.data);
+          if (j.type === 'hello') {
+            helloReceived = true;
+            canvas.width = j.width; canvas.height = j.height;
+            canvas.classList.remove('off');
+            stage.classList.add('off');
+            const desc = avccFromAnnexB(base64ToBytes(j.configBase64));
+            decoder = new VideoDecoder({
+              output: (frame) => {
+                ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                frame.close();
+                frames++;
+              },
+              error: (e) => console.warn('decoder', e),
+            });
+            decoder.configure({
+              codec: 'avc1.42E01F',          // Baseline 3.1 — broadest support
+              codedWidth: j.width,
+              codedHeight: j.height,
+              description: desc,
+              optimizeForLatency: true,
+            });
+            mode = 'h264';
+            codecEl.textContent = 'H.264';
+          } else if (j.type === 'error') {
+            // Phone says no H.264 stream available. Don't auto-fall-back
+            // to MJPEG — in H.264 mode the MJPEG endpoint returns 503 and
+            // the broken <img> placeholder looks worse than a clear error.
+            console.warn('ws error:', j);
+            try { ws.close(); } catch {}
+          }
+        } catch (e) {
+          console.warn('hello parse', e);
+        }
+      } else {
+        if (!decoder || decoder.state !== 'configured') return;
+        // First byte of an annex-B access unit's NAL header tells us
+        // whether it's an IDR (keyframe) — type 5.
+        const buf = new Uint8Array(ev.data);
+        const nalType = firstNalType(buf);
+        const isKey = nalType === 5;
+        try {
+          decoder.decode(new EncodedVideoChunk({
+            type: isKey ? 'key' : 'delta',
+            timestamp: performance.now() * 1000,
+            data: buf,
+          }));
+        } catch (e) {
+          console.warn('decode', e);
+        }
+      }
+    };
+    ws.onclose = () => {
+      h264Conn = null;
+      h264Connecting = false;
+      if (decoder) try { decoder.close(); } catch {}
+      decoder = null;
+      // If we never got a hello frame, the WS was rejected — most
+      // commonly auth (browsers don't always forward Basic auth to
+      // WS handshakes). Status polling will pick it up and re-try
+      // on the next tick.
+      if (!helloReceived && desiredMode === 'H264') {
+        status.textContent = 'WS closed — auth or no stream';
+        canvas.classList.add('off');
+      }
+    };
+    ws.onerror = () => {
+      h264Conn = null;
+      h264Connecting = false;
+    };
+    h264Conn = ws;
+  }
+
+  function stopH264() {
+    if (h264Conn) try { h264Conn.close(); } catch {}
+    h264Conn = null;
+    canvas.classList.add('off');
+    if (mode === 'h264') mode = null;
+  }
+
+  // ── MJPEG fallback ───────────────────────────────────────────────
+  function startMjpeg(_why) {
+    mode = 'mjpeg';
+    codecEl.textContent = 'MJPEG';
+    canvas.classList.add('off');
+    stage.classList.remove('off');
+    stage.src = '/api/screen?t=' + Date.now();
+    mjpegRunning = true;
+  }
+  function stopMjpeg() {
+    mjpegRunning = false;
+    stage.src = '';
+    stage.classList.add('off');
+    if (mode === 'mjpeg') mode = null;
+  }
+
+  // ── Status polling ───────────────────────────────────────────────
   async function checkStatus() {
     try {
       const r = await fetch('/api/screen/status', { credentials: 'include' });
       if (!r.ok) throw new Error(r.status);
       const j = await r.json();
       if (j.running) {
-        if (!running) {
-          running = true;
-          // bust browser cache so the <img> opens a fresh MJPEG conn
-          stage.src = '/api/screen?t=' + Date.now();
-          stage.classList.remove('off');
-          offline.style.display = 'none';
-          status.textContent = 'Live · ' + (j.mode || '');
-          status.classList.add('live');
-        } else {
-          status.textContent = 'Live · ' + (j.mode || '');
+        desiredMode = j.mode;
+        const wantH264 = (j.mode === 'H264');
+        if (wantH264 && mode !== 'h264' && !h264Connecting) {
+          stopMjpeg();
+          await startH264();
+        } else if (!wantH264 && mode !== 'mjpeg') {
+          stopH264();
+          startMjpeg('mode-switched');
         }
+        offline.style.display = 'none';
+        status.textContent = 'Live · ' + (j.mode || '');
+        status.classList.add('live');
         dims.textContent = j.width && j.height ? `${j.width} × ${j.height}` : '—';
         if (typeof j.fps === 'number' && j.fps > 0) {
           fpsEl.textContent = j.fps.toFixed(1) + ' fps';
         }
       } else {
-        if (running) {
-          running = false;
-          stage.src = '';
-        }
-        stage.classList.add('off');
+        stopH264();
+        stopMjpeg();
+        mode = null;
         offline.style.display = '';
         status.textContent = 'Off';
         status.classList.remove('live');
         dims.textContent = '—';
         fpsEl.textContent = '— fps';
+        codecEl.textContent = '—';
       }
-    } catch (e) {
+    } catch {
       status.textContent = 'Error';
       offline.style.display = '';
     }
   }
-
-  // Each frame the <img> renders fires a load event (MJPEG is one continuous response, but each part triggers a paint).
-  // Most browsers fire load on first render only — fall back to polling status for liveness.
   setInterval(checkStatus, 2000);
   checkStatus();
 
-  // Approximate fps via timer that watches naturalWidth changes — naive but good enough.
   setInterval(() => {
-    if (!running) return;
+    if (!mode) return;
     const now = performance.now();
     const dt = (now - lastFpsTick) / 1000;
-    if (dt > 0) fpsEl.textContent = `${(frames / dt).toFixed(1)} fps`;
+    if (dt > 0 && mode === 'h264') fpsEl.textContent = `${(frames / dt).toFixed(1)} fps`;
     frames = 0;
     lastFpsTick = now;
   }, 1000);
-  // Hook load events — fires once per multipart part on Chrome/Edge/Safari.
-  stage.addEventListener('load', () => frames++);
+  stage.addEventListener('load', () => { if (mode === 'mjpeg') frames++; });
 
   fsBtn.addEventListener('click', () => {
     if (document.fullscreenElement) document.exitFullscreen();
-    else stage.requestFullscreen?.();
+    else {
+      const el = mode === 'h264' ? canvas : stage;
+      el.requestFullscreen?.();
+    }
   });
+
+  // ── Helpers ──────────────────────────────────────────────────────
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // Find the NAL unit type byte at the start of an annex-B access unit.
+  // Format: [00 00 00 01 | 00 00 01] <nal>... Where <nal> high bit is
+  // forbidden, next 2 bits = nal_ref_idc, low 5 bits = nal_unit_type.
+  function firstNalType(buf) {
+    let i = 0;
+    while (i < buf.length - 4) {
+      if (buf[i] === 0 && buf[i+1] === 0 && buf[i+2] === 0 && buf[i+3] === 1) {
+        return buf[i+4] & 0x1f;
+      }
+      if (buf[i] === 0 && buf[i+1] === 0 && buf[i+2] === 1) {
+        return buf[i+3] & 0x1f;
+      }
+      i++;
+    }
+    return 0;
+  }
+
+  // Build an avcC (AVCDecoderConfigurationRecord) from raw annex-B
+  // SPS/PPS bytes — that's the shape WebCodecs `description` expects
+  // for codec='avc1.*'. We scan the annex-B blob for SPS (type 7) and
+  // PPS (type 8) NALs and reassemble them in avcC form.
+  function avccFromAnnexB(blob) {
+    const nals = splitAnnexB(blob);
+    let sps = null, pps = null;
+    for (const n of nals) {
+      const t = n[0] & 0x1f;
+      if (t === 7) sps = n;
+      else if (t === 8) pps = n;
+    }
+    if (!sps || !pps) return blob; // best-effort fallback
+
+    const out = [];
+    out.push(1);                    // configurationVersion
+    out.push(sps[1], sps[2], sps[3]); // AVCProfileIndication / profile_compatibility / level
+    out.push(0xFF);                 // 6 reserved bits + lengthSizeMinusOne (3 = 4-byte)
+    out.push(0xE1);                 // 3 reserved bits + numOfSequenceParameterSets (1)
+    out.push((sps.length >> 8) & 0xFF, sps.length & 0xFF);
+    for (let i = 0; i < sps.length; i++) out.push(sps[i]);
+    out.push(1);                    // numOfPictureParameterSets
+    out.push((pps.length >> 8) & 0xFF, pps.length & 0xFF);
+    for (let i = 0; i < pps.length; i++) out.push(pps[i]);
+    return new Uint8Array(out);
+  }
+
+  function splitAnnexB(blob) {
+    const out = [];
+    let start = -1;
+    for (let i = 0; i < blob.length - 3; i++) {
+      const is4 = blob[i] === 0 && blob[i+1] === 0 && blob[i+2] === 0 && blob[i+3] === 1;
+      const is3 = blob[i] === 0 && blob[i+1] === 0 && blob[i+2] === 1;
+      if (is4 || is3) {
+        if (start !== -1) out.push(blob.subarray(start, i));
+        start = i + (is4 ? 4 : 3);
+        i = start - 1;
+      }
+    }
+    if (start !== -1 && start < blob.length) out.push(blob.subarray(start));
+    return out;
+  }
 </script>
 </body>
 </html>

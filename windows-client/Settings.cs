@@ -22,6 +22,24 @@ public sealed class Settings
     public bool AutoConnect { get; set; } = true;
 
     /// <summary>
+    /// When true, clipboard changes flow both ways automatically:
+    ///   - phone clipboard.changed event → Windows clipboard
+    ///   - Windows clipboard change → phone /api/clipboard PUT
+    /// Default on — that's almost universally what people want when
+    /// they install a "share between devices" tool. User can toggle
+    /// off via the tray's Clipboard submenu.
+    /// </summary>
+    public bool ClipboardAutoMirror { get; set; } = true;
+
+    /// <summary>
+    /// Per-phone Bearer tokens issued via /api/auth/pair. Key = phone's
+    /// mDNS instance name. Value = DPAPI-encrypted token (Base64).
+    /// Once we have a token for a phone we prefer Bearer auth and the
+    /// PIN is only consulted to re-pair if the token gets revoked.
+    /// </summary>
+    public Dictionary<string, string> KnownDeviceTokens { get; set; } = new();
+
+    /// <summary>
     /// Saved phone passwords. Key = phone's mDNS instance name (stable
     /// per-phone identity). Value = DPAPI-encrypted password (Base64).
     /// Encrypts under CurrentUser scope so other users on the same PC

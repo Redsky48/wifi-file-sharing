@@ -21,11 +21,11 @@ public sealed class HealthChecker : IDisposable
 
     public event Action? Lost;
 
-    public void Start(string baseUrl, string? password)
+    public void Start(string baseUrl, string? password, string? bearerToken = null)
     {
         Stop();
         _http.Dispose();
-        _http = AuthHttp.Build(new Uri(baseUrl), password, TimeSpan.FromSeconds(8));
+        _http = AuthHttp.Build(new Uri(baseUrl), password, TimeSpan.FromSeconds(8), bearerToken);
         _cts = new CancellationTokenSource();
         _ = Task.Run(() => Loop(baseUrl, _cts.Token));
     }

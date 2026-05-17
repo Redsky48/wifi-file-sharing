@@ -5,12 +5,13 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>icon.ico</ApplicationIcon>
     <RootNamespace>WiFiShareTray</RootNamespace>
     <AssemblyName>WiFiShareTray</AssemblyName>
-    <Version>0.10.0</Version>
+    <Version>0.11.0</Version>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
@@ -29,6 +30,21 @@
 
   <ItemGroup>
     <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
+    <!-- FFmpeg P/Invoke bindings for H.264 decoding in the WinForms
+         viewer. The bindings (FFmpeg.AutoGen) are ~150 KB; the actual
+         native DLLs (avcodec/avformat/avutil/swscale, ~25 MB total) come
+         from Sdcb.FFmpeg.runtime.windows-x64 — same FFmpeg 7.x ABI, just
+         a different NuGet packager. Combining them avoids having to ship
+         binaries in the repo. -->
+    <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
+    <PackageReference Include="Sdcb.FFmpeg.runtime.windows-x64" Version="7.1.0" />
+  </ItemGroup>
+
+  <!-- Allow user-supplied DLLs in lib/ffmpeg/ to override the NuGet
+       binaries — handy for testing a custom FFmpeg build without
+       editing the csproj. Empty by default; tests can drop files in. -->
+  <ItemGroup>
+    <None Include="lib\ffmpeg\**\*.dll" CopyToOutputDirectory="PreserveNewest" Link="ffmpeg\%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>

@@ -27,6 +27,15 @@ object IntentHelpers {
         return launch(context, Intent.createChooser(intent, "Open with"), "No app can open this file")
     }
 
+    fun shareFile(context: Context, fileUri: Uri, mime: String?): Boolean {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = mime ?: "*/*"
+            putExtra(Intent.EXTRA_STREAM, fileUri)
+            flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        return launch(context, Intent.createChooser(intent, "Share with"), "No app can share this file")
+    }
+
     private fun launch(context: Context, intent: Intent, fallbackMessage: String): Boolean {
         return try {
             context.startActivity(intent)

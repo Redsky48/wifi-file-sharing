@@ -30,7 +30,7 @@ public sealed class PhoneEventSubscriber : IDisposable
         _settings = settings;
     }
 
-    public void Start(string baseUrl, string? password)
+    public void Start(string baseUrl, string? password, string? bearerToken = null)
     {
         Stop();
         _baseUrl = baseUrl.TrimEnd('/');
@@ -39,7 +39,7 @@ public sealed class PhoneEventSubscriber : IDisposable
         // Infinite read timeout — SSE connections stay open indefinitely.
         // We rely on the phone's 20-second keepalive ping to detect dead
         // sockets at the TCP level.
-        _http = AuthHttp.Build(new Uri(_baseUrl), password, Timeout.InfiniteTimeSpan);
+        _http = AuthHttp.Build(new Uri(_baseUrl), password, Timeout.InfiniteTimeSpan, bearerToken);
         _cts = new CancellationTokenSource();
         _ = Task.Run(() => Loop(_cts.Token));
     }

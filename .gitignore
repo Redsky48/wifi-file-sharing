@@ -12,6 +12,17 @@ captures/
 *.keystore
 release/
 
+# Windows tray .exe — bundled into APK assets but >100 MB after
+# embedding ffmpeg shared libs, which GitHub refuses. Rebuilt by
+# build.sh on every push, so no point versioning it.
+app/src/main/assets/win/WiFiShareTray.exe
+windows-client/bin/
+windows-client/obj/
+
+# JVM / gradle daemon crash dumps
+replay_pid*.log
+hs_err_pid*.log
+
 # IDE files
 .vscode/
 *.swp

@@ -3,6 +3,7 @@ package com.wifishare.server
 import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
+import com.wifishare.input.RemoteInputService
 import com.wifishare.screen.ScreenCast
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoWSD
@@ -58,6 +59,7 @@ class FileServer(
         val path = handshake.uri.trimEnd('/').ifEmpty { "/" }
         return when (path) {
             "/ws/events" -> EventsWebSocket(handshake)
+            "/ws/screen" -> H264ScreenWebSocket(handshake)
             else -> RejectedWebSocket(handshake, reason = "unknown path")
         }
     }
@@ -148,6 +150,16 @@ class FileServer(
                 path == "/api/move" -> moveEndpoint(session)
                 path == "/api/copy" -> copyEndpoint(session)
                 path == "/api/notify" -> notifyEndpoint(session)
+                path == "/api/clipboard" -> clipboardEndpoint(session)
+                path == "/api/auth/pair" -> authPairEndpoint(session)
+                path == "/api/auth/tokens" -> authListTokens(session)
+                path.startsWith("/api/auth/tokens/") -> authRevokeToken(session, path)
+                path == "/api/input/tap" -> inputTap(session)
+                path == "/api/input/swipe" -> inputSwipe(session)
+                path == "/api/input/scroll" -> inputScroll(session)
+                path == "/api/input/key" -> inputKey(session)
+                path == "/api/input/drag" -> inputDrag(session)
+                path == "/api/input/status" -> inputStatusEndpoint()
                 path == "/api/events" -> sseEventsEndpoint(session)
                 path == "/api/manifest" -> manifestEndpoint()
                 path == "/api/screen" -> screenMjpegEndpoint()
@@ -439,10 +451,24 @@ class FileServer(
         val ip = session.remoteIpAddress.orEmpty()
         if (AuthGate.isLockedOut(ip)) return false
 
-        // Accept either Authorization header (browser fetch / WebDAV /
-        // companion app) or a wifishare_auth cookie (browser <img>/<video>
-        // tags can't add headers but DO send cookies, which is what makes
-        // inline streaming work).
+        // 1. Bearer token (preferred — per-device, individually revocable).
+        val bearer = parseBearerToken(session.headers["authorization"])
+        if (bearer != null) {
+            val dev = TokenStore.resolve(bearer)
+            if (dev != null) {
+                AuthGate.noteSuccess(ip)
+                return true
+            }
+            // Bad bearer — count as failure but fall through so a client
+            // that's both Basic+Bearer-aware can still get in via PIN.
+            AuthGate.noteFailure(ip)
+            return false
+        }
+
+        // 2. Basic auth (PIN) — works for the initial pair handshake,
+        //    WebDAV mini-redirector, and curl-style scripts.
+        // 3. Cookie auth — browser <img>/<video> tags can't add headers
+        //    but DO send cookies, which is what makes inline streaming work.
         val supplied = parseBasicPassword(session.headers["authorization"])
             ?: parseCookieAuth(session.headers["cookie"])
         if (supplied == null) {
@@ -454,6 +480,11 @@ class FileServer(
         val ok = constantTimeEquals(supplied, config.password)
         if (ok) AuthGate.noteSuccess(ip) else AuthGate.noteFailure(ip)
         return ok
+    }
+
+    private fun parseBearerToken(header: String?): String? {
+        if (header == null || !header.startsWith("Bearer ", ignoreCase = true)) return null
+        return header.substring(7).trim().takeIf { it.isNotBlank() }
     }
 
     private fun parseBasicPassword(header: String?): String? {
@@ -496,10 +527,11 @@ class FileServer(
             "Authentication required\n",
         )
         // WWW-Authenticate triggers the browser's ugly native sign-in
-        // popup — we only want it on /dav so Windows' WebDAV mini-redirector
-        // knows to send credentials. Other endpoints (favicon.ico, /api/*)
-        // get a plain 401 and the JS layer handles it.
-        if (path.startsWith("/dav")) {
+        // popup — useful for paths where the user is *deliberately*
+        // visiting in a browser (/screen viewer, /dav for Windows
+        // mini-redirector). API endpoints get a plain 401 and the
+        // JS layer handles it.
+        if (path.startsWith("/dav") || path.startsWith("/screen") || path.startsWith("/api/screen")) {
             r.addHeader("WWW-Authenticate", "Basic realm=\"WiFi Share\"")
         }
         return r
@@ -951,6 +983,13 @@ class FileServer(
             return json(Response.Status.lookup(503) ?: Response.Status.INTERNAL_ERROR,
                 """{"error":"screen cast is not running","hint":"open the phone app and tap Cast screen"}""")
         }
+        // H.264 mode doesn't produce JPEG frames; redirect the client to
+        // the WebSocket endpoint or the in-browser viewer (which speaks
+        // both via WebCodecs).
+        if (ScreenCast.mode.value.isH264) {
+            return json(Response.Status.lookup(503) ?: Response.Status.INTERNAL_ERROR,
+                """{"error":"phone is casting in H.264 mode","codec":"h264","hint":"use /ws/screen WebSocket or open /screen in a browser"}""")
+        }
         val boundary = "wifishareframe"
         val stream = MjpegInputStream(boundary)
         stream.startSubscriber()
@@ -979,16 +1018,255 @@ class FileServer(
         return resp
     }
 
+    /**
+     * GET → returns current clipboard text. PUT/POST → sets it. Body may
+     * be raw text (Content-Type: text/plain) or JSON `{"text": "..."}`.
+     *
+     * Empty PUT body intentionally clears the clipboard — symmetric with
+     * how text editors treat a delete-all save.
+     */
+    private fun clipboardEndpoint(session: IHTTPSession): Response {
+        return when (session.method.name.uppercase()) {
+            "GET" -> {
+                // Force a synchronous re-read so we don't depend on the
+                // listener having fired since attach — useful if the
+                // user just enabled accessibility and the cache is
+                // still empty.
+                val text = ClipboardBridge.forceRead(context)
+                val payload = JSONObject()
+                    .put("text", text)
+                    .put("length", text.length)
+                    .put("listenerBound", ClipboardBridge.isBound())
+                    .put("accessibilityEnabled",
+                        com.wifishare.input.RemoteInputService.isEnabled(context))
+                    .toString()
+                json(Response.Status.OK, payload)
+            }
+            "PUT", "POST" -> {
+                // NanoHTTPD's parseBody() only fills files["postData"]
+                // for POST requests; PUT bodies vanish into the void.
+                // Read the raw body off the input stream ourselves so
+                // the PC client's PUT works the same as a curl POST.
+                val contentLength = session.headers["content-length"]?.toIntOrNull() ?: 0
+                val ct = session.headers["content-type"]?.lowercase().orEmpty()
+                val rawBody = if (contentLength > 0) {
+                    val buf = ByteArray(contentLength)
+                    var read = 0
+                    while (read < contentLength) {
+                        val n = session.inputStream.read(buf, read, contentLength - read)
+                        if (n <= 0) break
+                        read += n
+                    }
+                    String(buf, 0, read, Charsets.UTF_8)
+                } else {
+                    // Length-less body or query-string fallback
+                    session.parameters["text"]?.firstOrNull() ?: ""
+                }
+                val bodyText = if (ct.contains("application/json")) {
+                    runCatching { JSONObject(rawBody).optString("text", "") }.getOrDefault("")
+                } else {
+                    rawBody
+                }
+                ClipboardBridge.setText(context, bodyText)
+                json(Response.Status.OK, JSONObject().put("ok", true).put("length", bodyText.length).toString())
+            }
+            else -> json(Response.Status.METHOD_NOT_ALLOWED, """{"error":"GET, PUT, POST only"}""")
+        }
+    }
+
+    /**
+     * Trade the PIN for a per-device Bearer token. Body is JSON
+     * `{"name": "DESKTOP-XYZ"}` — the friendly name shown back in
+     * /api/auth/tokens and on the phone for revoke.
+     *
+     * Auth: caller must already be authorized (Basic with the PIN, or
+     * an existing token). Tokens issued here replace any prior token
+     * for the same name — re-pairing is the standard rotation flow.
+     */
+    private fun authPairEndpoint(session: IHTTPSession): Response {
+        if (!session.method.name.equals("POST", true) &&
+            !session.method.name.equals("PUT", true)) {
+            return json(Response.Status.METHOD_NOT_ALLOWED, """{"error":"POST/PUT only"}""")
+        }
+        val files = HashMap<String, String>()
+        runCatching { session.parseBody(files) }
+        val ct = session.headers["content-type"]?.lowercase().orEmpty()
+        val name: String = if (ct.contains("application/json")) {
+            runCatching { JSONObject(files["postData"] ?: "").optString("name", "") }
+                .getOrDefault("")
+        } else {
+            session.parameters["name"]?.firstOrNull() ?: ""
+        }
+        if (name.isBlank()) return badRequest("name required")
+
+        val dev = TokenStore.pair(name)
+        val payload = JSONObject()
+            .put("id", dev.id)
+            .put("name", dev.name)
+            .put("token", dev.token)
+            .put("createdAt", dev.createdAt)
+        return json(Response.Status.OK, payload.toString())
+    }
+
+    private fun authListTokens(@Suppress("UNUSED_PARAMETER") session: IHTTPSession): Response {
+        val arr = JSONArray()
+        for (d in TokenStore.list()) {
+            arr.put(JSONObject().apply {
+                put("id", d.id)
+                put("name", d.name)
+                put("createdAt", d.createdAt)
+                put("lastUsedAt", d.lastUsedAt)
+            })
+        }
+        return json(Response.Status.OK, arr.toString())
+    }
+
+    private fun authRevokeToken(session: IHTTPSession, path: String): Response {
+        if (!session.method.name.equals("DELETE", true)) {
+            return json(Response.Status.METHOD_NOT_ALLOWED, """{"error":"DELETE only"}""")
+        }
+        val id = path.removePrefix("/api/auth/tokens/")
+        val ok = TokenStore.revoke(id)
+        return if (ok) json(Response.Status.OK, """{"revoked":"$id"}""")
+        else json(Response.Status.NOT_FOUND, """{"error":"unknown token id"}""")
+    }
+
+    private fun inputStatusEndpoint(): Response {
+        val available = RemoteInputService.isAvailable
+        val payload = JSONObject()
+            .put("available", available)
+            .put("hint", if (available)
+                "POST /api/input/tap?x=&y= · /api/input/swipe?x1=&y1=&x2=&y2=&duration= · /api/input/scroll?x=&y=&dy= · /api/input/key?action=back|home|recents"
+            else
+                "Enable WiFi Share remote input in Settings → Accessibility on the phone.")
+        return json(Response.Status.OK, payload.toString())
+    }
+
+    // Real display size (in physical screen pixels) for converting
+    // normalized client coordinates. Captured frames are scaled down
+    // before encoding, so the captured w/h is *not* what we want for
+    // gesture dispatch — Accessibility gestures need actual pixels.
+    private fun realDisplaySize(): Pair<Int, Int> {
+        val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE)
+            as android.view.WindowManager
+        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            val b = wm.maximumWindowMetrics.bounds
+            b.width() to b.height()
+        } else {
+            @Suppress("DEPRECATION")
+            val display = wm.defaultDisplay
+            val dm = android.util.DisplayMetrics()
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(dm)
+            dm.widthPixels to dm.heightPixels
+        }
+    }
+
+    /** Reads either `nx` (0..1 normalized) or `x` (absolute pixels). */
+    private fun readCoord(session: IHTTPSession, normName: String, pixName: String, axis: Int): Float? {
+        val n = session.parameters[normName]?.firstOrNull()?.toFloatOrNull()
+        if (n != null) return n * axis
+        return session.parameters[pixName]?.firstOrNull()?.toFloatOrNull()
+    }
+
+    private fun inputTap(session: IHTTPSession): Response {
+        val svc = RemoteInputService.instance ?: return inputNotEnabled()
+        val (rw, rh) = realDisplaySize()
+        val x = readCoord(session, "nx", "x", rw) ?: return badRequest("x or nx required")
+        val y = readCoord(session, "ny", "y", rh) ?: return badRequest("y or ny required")
+        val dur = session.parameters["duration"]?.firstOrNull()?.toLongOrNull() ?: 40L
+        val ok = svc.tap(x, y, dur)
+        return json(Response.Status.OK, """{"dispatched":$ok,"x":$x,"y":$y}""")
+    }
+
+    private fun inputSwipe(session: IHTTPSession): Response {
+        val svc = RemoteInputService.instance ?: return inputNotEnabled()
+        val (rw, rh) = realDisplaySize()
+        val x1 = readCoord(session, "nx1", "x1", rw) ?: return badRequest("x1 or nx1 required")
+        val y1 = readCoord(session, "ny1", "y1", rh) ?: return badRequest("y1 or ny1 required")
+        val x2 = readCoord(session, "nx2", "x2", rw) ?: return badRequest("x2 or nx2 required")
+        val y2 = readCoord(session, "ny2", "y2", rh) ?: return badRequest("y2 or ny2 required")
+        val dur = session.parameters["duration"]?.firstOrNull()?.toLongOrNull() ?: 250L
+        val ok = svc.swipe(x1, y1, x2, y2, dur)
+        return json(Response.Status.OK, """{"dispatched":$ok}""")
+    }
+
+    private fun inputScroll(session: IHTTPSession): Response {
+        val svc = RemoteInputService.instance ?: return inputNotEnabled()
+        val (rw, rh) = realDisplaySize()
+        val x = readCoord(session, "nx", "x", rw) ?: return badRequest("x or nx required")
+        val y = readCoord(session, "ny", "y", rh) ?: return badRequest("y or ny required")
+        // dx/dy stay in pixels (relative deltas) — but allow ndx/ndy too.
+        val dx = readCoord(session, "ndx", "dx", rw) ?: 0f
+        val dy = readCoord(session, "ndy", "dy", rh) ?: 0f
+        if (dx == 0f && dy == 0f) return badRequest("at least one of dx, dy must be non-zero")
+        val ok = svc.scroll(x, y, dx, dy)
+        return json(Response.Status.OK, """{"dispatched":$ok}""")
+    }
+
+    /**
+     * Continuous-drag endpoint. Client sends three phases per gesture:
+     *   POST /api/input/drag?phase=start&nx=&ny=
+     *   POST /api/input/drag?phase=move&nx=&ny=    (many, throttled)
+     *   POST /api/input/drag?phase=end&nx=&ny=
+     *
+     * Server chains StrokeDescription.continueStroke() so the finger
+     * never lifts between segments — fluid scroll/pan instead of the
+     * stop-start juddering you get with one-shot swipes.
+     */
+    private fun inputDrag(session: IHTTPSession): Response {
+        val svc = RemoteInputService.instance ?: return inputNotEnabled()
+        val phase = session.parameters["phase"]?.firstOrNull()?.lowercase()
+            ?: return badRequest("phase required (start|move|end|cancel)")
+        if (phase == "cancel") { svc.dragCancel(); return json(Response.Status.OK, """{"ok":true}""") }
+        val (rw, rh) = realDisplaySize()
+        val x = readCoord(session, "nx", "x", rw) ?: return badRequest("x or nx required")
+        val y = readCoord(session, "ny", "y", rh) ?: return badRequest("y or ny required")
+        // Each segment's duration controls how long Android animates
+        // the finger move on that segment. Short = snappy; default
+        // 40 ms gives 25 fps "movement" which our client emits at.
+        val dur = session.parameters["duration"]?.firstOrNull()?.toLongOrNull() ?: 40L
+        val ok = when (phase) {
+            "start" -> svc.dragStart(x, y, dur)
+            "move" -> svc.dragMove(x, y, dur)
+            "end" -> svc.dragEnd(x, y, dur)
+            else -> return badRequest("unknown phase: $phase")
+        }
+        return json(Response.Status.OK, """{"dispatched":$ok,"phase":"$phase"}""")
+    }
+
+    private fun inputKey(session: IHTTPSession): Response {
+        val svc = RemoteInputService.instance ?: return inputNotEnabled()
+        val action = session.parameters["action"]?.firstOrNull()
+            ?: return badRequest("action required (back|home|recents|notifications|quick_settings|lock|power)")
+        val ok = svc.globalKey(action)
+        return if (ok) json(Response.Status.OK, """{"dispatched":true}""")
+        else badRequest("unknown action: $action")
+    }
+
+    private fun inputNotEnabled(): Response =
+        json(
+            Response.Status.lookup(503) ?: Response.Status.INTERNAL_ERROR,
+            """{"error":"remote input not enabled","hint":"open Settings → Accessibility → WiFi Share, turn it on"}""",
+        )
+
     private fun screenStatusEndpoint(): Response {
         val running = ScreenCast.state.value == ScreenCast.State.Running
+        // Agents that drive touch input need the REAL display pixels —
+        // captured frames are scaled (Quality=1280 long-edge, etc.),
+        // so the on-the-wire width/height isn't enough.
+        val (rw, rh) = realDisplaySize()
         val out = JSONObject()
             .put("running", running)
             .put("frameCount", ScreenCast.frameCount)
             .put("width", ScreenCast.width)
             .put("height", ScreenCast.height)
+            .put("realWidth", rw)
+            .put("realHeight", rh)
             .put("fps", ScreenCast.measuredFps)
             .put("mode", ScreenCast.mode.value.name)
-            .put("note", "GET /api/screen for MJPEG stream, /api/screen.jpg for single frame, /screen for viewer page")
+            .put("inputReady", RemoteInputService.isAvailable)
+            .put("note", "Send normalized 0..1 coords to /api/input/* — server scales by realWidth/realHeight.")
         return json(Response.Status.OK, out.toString())
     }
 
@@ -1017,15 +1295,80 @@ class FileServer(
             "GET /api/clients" to "Active clients (recent IPs + companion registrations).",
             "POST /api/clients/register" to "Register a stable clientId / friendly name.",
             "GET /api/queue/{clientId}" to "Pull next queued file for this client.",
+            "GET /api/clipboard" to "Read current phone clipboard text (requires Accessibility).",
+            "PUT /api/clipboard" to "Set phone clipboard (raw text body or JSON {text}).",
             "WS  /ws/events" to "WebSocket push channel — same source as /api/events.",
             "GET /api/events" to "Server-Sent Events: live stream of every event envelope.",
             "GET /api/screen" to "MJPEG screen-cast stream (multipart/x-mixed-replace). Requires user to start cast from phone app.",
+            "WS  /ws/screen" to "Binary H.264 stream (annex-B). Hello frame carries SPS/PPS as base64.",
             "GET /api/screen.jpg" to "Latest single JPEG frame of the screen cast.",
-            "GET /api/screen/status" to "Cast on/off + frame counter + dimensions.",
-            "GET /screen" to "Browser viewer HTML page that displays /api/screen.",
+            "GET /api/screen/status" to "Cast on/off + capture dims + REAL screen dims + fps + mode + inputReady flag.",
+            "POST /api/input/tap?nx=&ny=" to "Single tap at normalized 0..1 coords (or absolute x=&y= pixels). Requires Accessibility.",
+            "POST /api/input/swipe?nx1=&ny1=&nx2=&ny2=&duration=" to "One-shot swipe from A→B over N ms.",
+            "POST /api/input/scroll?nx=&ny=&ndx=&ndy=" to "Short fling centered on (x,y) by (dx,dy) — normalized fractions.",
+            "POST /api/input/drag?phase=start|move|end|cancel&nx=&ny=&duration=" to "Continuous gesture (chained strokes — finger never lifts mid-drag). Open with start, stream move calls, close with end.",
+            "POST /api/input/key?action=back|home|recents|notifications|quick_settings|lock|power" to "Inject one of the system global actions.",
+            "GET /api/input/status" to "Whether the AccessibilityService is bound (input ready).",
+            "GET /screen" to "Browser viewer HTML page — auto-detects H.264 vs MJPEG and falls back gracefully.",
             "GET /docs" to "Human-readable HTML docs for all of the above.",
         ).forEach { (path, desc) ->
             endpoints.put(JSONObject().put("path", path).put("description", desc))
+        }
+        val recipes = JSONArray()
+        listOf(
+            Triple(
+                "Drive the phone end-to-end (view + control)",
+                listOf("touch", "control", "screen"),
+                listOf(
+                    "GET /api/screen/status → grab realWidth, realHeight, inputReady",
+                    "If inputReady=false, prompt user to enable WiFi Share remote input under Accessibility settings",
+                    "Open WS /ws/screen for the live H.264 feed (binary frames) — or just poll /api/screen.jpg for stills",
+                    "For every action, POST a normalized 0..1 coord to /api/input/tap, /swipe, /scroll, or the /drag protocol",
+                    "Coordinates: (0,0) is top-left of the phone display; (1,1) is bottom-right. Server multiplies by realWidth/realHeight.",
+                ),
+            ),
+            Triple(
+                "Tap a UI element you see at (px,py) in the captured frame",
+                listOf("tap"),
+                listOf(
+                    "Compute normalized coords: nx = px / captured_width, ny = py / captured_height",
+                    "POST /api/input/tap?nx=NX&ny=NY",
+                    "Server multiplies by realWidth/realHeight from /api/screen/status — same answer regardless of capture mode (Quality / Balanced / H.264 / etc).",
+                ),
+            ),
+            Triple(
+                "Continuous scroll / pan (multi-segment)",
+                listOf("drag", "scroll", "pan"),
+                listOf(
+                    "POST /api/input/drag?phase=start&nx=0.5&ny=0.7",
+                    "Repeat: POST /api/input/drag?phase=move&nx=NEXT_X&ny=NEXT_Y&duration=35 every ~30 ms",
+                    "Finish: POST /api/input/drag?phase=end&nx=END_X&ny=END_Y",
+                    "Internally chained via Android Accessibility's continueStroke — finger stays down between segments, motion is fluid.",
+                ),
+            ),
+            Triple(
+                "Press the system Back / Home / Recents button",
+                listOf("key"),
+                listOf(
+                    "POST /api/input/key?action=back",
+                    "Or: home, recents, notifications, quick_settings, lock, power",
+                ),
+            ),
+            Triple(
+                "Synchronise clipboards",
+                listOf("clipboard"),
+                listOf(
+                    "Read phone: GET /api/clipboard → {text, length, listenerBound, accessibilityEnabled}",
+                    "Write phone: PUT /api/clipboard with body 'your text' (Content-Type: text/plain)",
+                    "Both directions require accessibility ON because Android 10+ blocks background clipboard reads otherwise.",
+                ),
+            ),
+        ).forEach { (intent, tags, steps) ->
+            val r = JSONObject()
+                .put("intent", intent)
+                .put("tags", JSONArray().apply { tags.forEach { put(it) } })
+                .put("steps", JSONArray().apply { steps.forEach { put(it) } })
+            recipes.put(r)
         }
         val out = JSONObject()
             .put("name", "WiFi Share phone API")
@@ -1039,11 +1382,18 @@ class FileServer(
                     "client.connected",
                     "client.disconnected",
                     "notification",
+                    "clipboard.changed",
                     "screen.started",
                     "screen.stopped",
                 ).forEach { put(it) }
             })
             .put("endpoints", endpoints)
+            .put("agentRecipes", recipes)
+            .put("auth", JSONObject().apply {
+                put("basic", "Authorization: Basic base64('user:' + PIN)")
+                put("bearer", "Authorization: Bearer <token>")
+                put("pair", "POST /api/auth/pair {\"name\":\"hostname\"} → token (preferred over PIN)")
+            })
         return json(Response.Status.OK, out.toString(2))
     }
 
@@ -1285,6 +1635,97 @@ private class EventsWebSocket(handshake: NanoHTTPD.IHTTPSession) : NanoWSD.WebSo
     override fun onException(exception: IOException?) {
         subscriberThread.interrupt()
         pingThread.interrupt()
+    }
+}
+
+/**
+ * Streams H.264 access units (annex-B bytes) over a binary WebSocket.
+ *
+ * Wire protocol:
+ *   - On connect we send ONE text frame: a JSON envelope describing
+ *     the codec, width, height, and the SPS+PPS bytes (base64) so the
+ *     browser can configure WebCodecs without parsing the stream.
+ *   - Then we send binary frames, one per encoded access unit, raw
+ *     annex-B (0x00 0x00 0x00 0x01 startcodes preserved).
+ *   - The first binary frame after `hello` is the most recent keyframe
+ *     (if we have one) so the decoder can render immediately instead
+ *     of waiting up to 1 s for the next I-frame.
+ */
+private class H264ScreenWebSocket(handshake: NanoHTTPD.IHTTPSession) : NanoWSD.WebSocket(handshake) {
+
+    @Volatile private var open = false
+    private val sink = com.wifishare.screen.ScreenCast.H264Sink { data, isKey, ptsUs ->
+        if (!open) return@H264Sink
+        try {
+            send(data)
+        } catch (_: Throwable) {
+            // Socket is dead (TCP RST, client gone, buffer overflow…).
+            // Just flip `open` — the !open check above means subsequent
+            // access units skip the send() call entirely. Final
+            // unregistration happens in onClose / onException so we
+            // don't try to reference `sink` from inside its own
+            // initialiser here.
+            open = false
+        }
+    }
+
+    override fun onOpen() {
+        open = true
+        val sc = com.wifishare.screen.ScreenCast
+        // MediaCodec emits SPS+PPS only on its first output buffer. When
+        // a viewer connects within ~200 ms of cast start, the config blob
+        // may not exist yet — poll briefly instead of giving up. Up to
+        // 3 s, which covers slow OEM encoders (Samsung phones can take
+        // ~500 ms to deliver the first buffer).
+        val deadline = System.currentTimeMillis() + 3000
+        while (sc.h264Config == null &&
+               sc.state.value == com.wifishare.screen.ScreenCast.State.Running &&
+               System.currentTimeMillis() < deadline &&
+               open
+        ) {
+            try { Thread.sleep(50) } catch (_: InterruptedException) { return }
+        }
+        if (!open) return
+        val cfg = sc.h264Config
+        if (cfg == null || sc.state.value != com.wifishare.screen.ScreenCast.State.Running) {
+            // Still no SPS — cast probably isn't running, or the encoder
+            // failed to initialise. Tell the viewer + close so it doesn't
+            // sit idle.
+            runCatching {
+                send("""{"type":"error","reason":"no_h264_stream","hint":"start cast in H.264 mode in the phone app"}""")
+                close(fi.iki.elonen.NanoWSD.WebSocketFrame.CloseCode.NormalClosure, "no-stream", false)
+            }
+            return
+        }
+        val configB64 = android.util.Base64.encodeToString(cfg, android.util.Base64.NO_WRAP)
+        val hello = org.json.JSONObject()
+            .put("type", "hello")
+            .put("codec", "h264")
+            .put("width", sc.h264Width)
+            .put("height", sc.h264Height)
+            .put("configBase64", configB64)
+            .toString()
+        runCatching { send(hello) }
+        // Replay the latest keyframe so the decoder can draw immediately
+        // instead of waiting up to 1 s for the next I-frame.
+        sc.lastKeyframe?.let { runCatching { send(it) } }
+        sc.registerSink(sink)
+    }
+
+    override fun onClose(
+        code: fi.iki.elonen.NanoWSD.WebSocketFrame.CloseCode?,
+        reason: String?,
+        initiatedByRemote: Boolean,
+    ) {
+        open = false
+        com.wifishare.screen.ScreenCast.unregisterSink(sink)
+    }
+
+    override fun onMessage(message: fi.iki.elonen.NanoWSD.WebSocketFrame?) { /* no-op */ }
+    override fun onPong(pong: fi.iki.elonen.NanoWSD.WebSocketFrame?) { /* no-op */ }
+    override fun onException(exception: IOException?) {
+        open = false
+        com.wifishare.screen.ScreenCast.unregisterSink(sink)
     }
 }
 

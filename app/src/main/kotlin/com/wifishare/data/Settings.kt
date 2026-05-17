@@ -21,6 +21,10 @@ data class AppSettings(
     val autoStart: Boolean = false,
     val passwordEnabled: Boolean = false,
     val password: String = "",
+    val quickConnectVisible: Boolean = true,
+    val useBiometric: Boolean = false,
+    val adaptiveBitrate: Boolean = true,
+    val notificationsEnabled: Boolean = true,
 )
 
 class SettingsRepository(private val context: Context) {
@@ -34,6 +38,10 @@ class SettingsRepository(private val context: Context) {
         val AUTO_START = booleanPreferencesKey("auto_start")
         val PASSWORD_ENABLED = booleanPreferencesKey("password_enabled")
         val PASSWORD = stringPreferencesKey("password")
+        val QUICK_CONNECT = booleanPreferencesKey("quick_connect")
+        val USE_BIOMETRIC = booleanPreferencesKey("use_biometric")
+        val ADAPTIVE_BITRATE = booleanPreferencesKey("adaptive_bitrate")
+        val NOTIFICATIONS = booleanPreferencesKey("notifications")
     }
 
     val settings: Flow<AppSettings> = context.dataStore.data.map { it.toSettings() }
@@ -60,6 +68,18 @@ class SettingsRepository(private val context: Context) {
     suspend fun setPassword(value: String) =
         context.dataStore.edit { it[Keys.PASSWORD] = value }
 
+    suspend fun setQuickConnectVisible(value: Boolean) =
+        context.dataStore.edit { it[Keys.QUICK_CONNECT] = value }
+
+    suspend fun setUseBiometric(value: Boolean) =
+        context.dataStore.edit { it[Keys.USE_BIOMETRIC] = value }
+
+    suspend fun setAdaptiveBitrate(value: Boolean) =
+        context.dataStore.edit { it[Keys.ADAPTIVE_BITRATE] = value }
+
+    suspend fun setNotificationsEnabled(value: Boolean) =
+        context.dataStore.edit { it[Keys.NOTIFICATIONS] = value }
+
     private fun Preferences.toSettings() = AppSettings(
         folderUri = this[Keys.FOLDER_URI],
         folderDisplay = this[Keys.FOLDER_DISPLAY] ?: "",
@@ -69,5 +89,9 @@ class SettingsRepository(private val context: Context) {
         autoStart = this[Keys.AUTO_START] ?: false,
         passwordEnabled = this[Keys.PASSWORD_ENABLED] ?: false,
         password = this[Keys.PASSWORD] ?: "",
+        quickConnectVisible = this[Keys.QUICK_CONNECT] ?: true,
+        useBiometric = this[Keys.USE_BIOMETRIC] ?: false,
+        adaptiveBitrate = this[Keys.ADAPTIVE_BITRATE] ?: true,
+        notificationsEnabled = this[Keys.NOTIFICATIONS] ?: true,
     )
 }

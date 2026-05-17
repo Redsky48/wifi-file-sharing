@@ -110,6 +110,7 @@ body { background: var(--bg); }
             <li><a href="#meta-api">Metadata & search</a> — info, storage, file stat, search</li>
             <li><a href="#system-api">System</a> — health, info, clients, queue, notify</li>
             <li><a href="#screen-cast">Screen cast</a> — phone screen → browser (video only)</li>
+            <li><a href="#remote-control">Remote control</a> — tap / drag / scroll / system keys (for agents)</li>
             <li><a href="#push-events">Push events</a> — WebSocket + Server-Sent Events for AI agents</li>
             <li><a href="#examples">Language examples</a> — curl / PowerShell / Python / JS</li>
             <li><a href="#watch-folder">Recipe: watch a PC folder, auto-send</a></li>
@@ -339,6 +340,82 @@ Invoke-RestMethod `
         <span class="endpoint-title">/api/screen/status</span>
     </div>
     <p>JSON: <code>{ running, frameCount, width, height }</code>. Tail this to see if cast is live.</p>
+
+    <h2 id="remote-control">Remote control — touch / drag / keys</h2>
+    <p>Once the phone user has enabled <b>WiFi Share remote input</b> under <i>Settings → Accessibility</i>, your scripts and AI agents can drive the phone via these endpoints. All coords are <b>normalized 0..1</b> fractions — (0,0) top-left, (1,1) bottom-right of the actual phone display. The server multiplies by real screen pixels for you.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">POST</span>
+        <span class="endpoint-title">/api/input/tap?nx=0..1&amp;ny=0..1</span>
+    </div>
+    <p>Single tap at the given fraction of the display.</p>
+    <pre><code>curl -u user:PIN -X POST "http://phone:8080/api/input/tap?nx=0.5&ny=0.5"</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">POST</span>
+        <span class="endpoint-title">/api/input/swipe?nx1=&amp;ny1=&amp;nx2=&amp;ny2=&amp;duration=</span>
+    </div>
+    <p>One-shot swipe A → B over <code>duration</code> ms (default 250). Good for fixed gestures (e.g. swipe-to-dismiss).</p>
+
+    <div class="endpoint">
+        <span class="method method-get">POST</span>
+        <span class="endpoint-title">/api/input/drag?phase=start|move|end|cancel&amp;nx=&amp;ny=&amp;duration=</span>
+    </div>
+    <p><b>Continuous</b> drag — the proper way to do scroll, pan, and any long motion. Uses Android Accessibility's <code>continueStroke</code> so the finger never lifts between segments.</p>
+    <pre><code># Open the drag at the starting point
+curl -u user:PIN -X POST "http://phone:8080/api/input/drag?phase=start&nx=0.5&ny=0.7"
+# Stream move calls (throttle to ~30 ms; duration 35 keeps each segment snappy)
+for i in 0.65 0.60 0.55 0.50 0.45 0.40; do
+  curl -u user:PIN -X POST "http://phone:8080/api/input/drag?phase=move&nx=0.5&ny=$i&duration=35"
+  sleep 0.03
+done
+# Lift the finger
+curl -u user:PIN -X POST "http://phone:8080/api/input/drag?phase=end&nx=0.5&ny=0.4"</code></pre>
+
+    <div class="endpoint">
+        <span class="method method-get">POST</span>
+        <span class="endpoint-title">/api/input/scroll?nx=&amp;ny=&amp;ndx=&amp;ndy=</span>
+    </div>
+    <p>Short fling centered on (nx, ny) by normalized delta (ndx, ndy). Convenience for wheel-style scrolling — use <code>/api/input/drag</code> for continuous motion.</p>
+
+    <div class="endpoint">
+        <span class="method method-get">POST</span>
+        <span class="endpoint-title">/api/input/key?action=back|home|recents|notifications|quick_settings|lock|power</span>
+    </div>
+    <p>System global actions. Most useful: <code>back</code>, <code>home</code>, <code>recents</code> (app switcher).</p>
+
+    <div class="endpoint">
+        <span class="method method-get">GET</span>
+        <span class="endpoint-title">/api/input/status</span>
+    </div>
+    <p>Returns <code>{available: bool, hint: ...}</code>. Hit this first — if <code>available</code> is false the user hasn't enabled accessibility yet and your inputs will return 503.</p>
+
+    <h3 id="agent-loop">Agent control loop</h3>
+    <p>Minimal Python agent that views + drives:</p>
+    <pre><code>import requests, time
+PHONE = "http://192.168.1.179:8080"
+AUTH  = ("user", "123456")
+
+# 1. Confirm the phone is casting + accepting input
+s = requests.get(f"{PHONE}/api/screen/status", auth=AUTH).json()
+assert s["running"], "ask user to start cast"
+assert s["inputReady"], "ask user to enable Accessibility"
+
+# 2. Pull a fresh frame to look at
+img = requests.get(f"{PHONE}/api/screen.jpg", auth=AUTH).content
+open("frame.jpg","wb").write(img)
+
+# 3. Tap a button (model decides 0..1 coords from the image)
+requests.post(f"{PHONE}/api/input/tap", params={"nx":0.5,"ny":0.92}, auth=AUTH)
+time.sleep(0.5)
+
+# 4. Smooth scroll down the page
+requests.post(f"{PHONE}/api/input/drag", params={"phase":"start","nx":0.5,"ny":0.8}, auth=AUTH)
+for y in [0.7, 0.6, 0.5, 0.4, 0.3]:
+    requests.post(f"{PHONE}/api/input/drag",
+        params={"phase":"move","nx":0.5,"ny":y,"duration":35}, auth=AUTH)
+    time.sleep(0.03)
+requests.post(f"{PHONE}/api/input/drag", params={"phase":"end","nx":0.5,"ny":0.3}, auth=AUTH)</code></pre>
 
     <h2 id="push-events">Push events</h2>
     <p>Subscribe to a live stream of every interesting event the phone emits — file transfers, queue changes, client connect/disconnect, custom notifications. Two transports deliver the same envelopes; pick whichever your client supports.</p>

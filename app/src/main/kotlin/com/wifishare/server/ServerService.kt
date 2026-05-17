@@ -80,7 +80,11 @@ class ServerService : Service() {
             FileServer.Config(folder, allowUploads, allowDelete, password),
         )
         try {
-            srv.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+            // NanoHTTPD.SOCKET_READ_TIMEOUT defaults to 5 s — fine for
+            // request reading but kills idle WebSocket connections. Lift
+            // to 60 s so the H.264 screen cast survives short pauses
+            // (and TCP keepalive / WS ping handles longer ones).
+            srv.start(60_000, false)
         } catch (e: Exception) {
             updateState(State.Error(e.message ?: "start failed"))
             stopSelf()
@@ -100,6 +104,15 @@ class ServerService : Service() {
                 authRequired = password.isNotEmpty(),
             )
         }
+
+        // Clipboard bridge — observes primary-clip changes and exposes
+        // them via the HTTP / WS event channels. Only works while we're
+        // a foreground service (Android 10+ background read restriction).
+        ClipboardBridge.attach(applicationContext)
+
+        // Token store — per-device Bearer tokens. Lives in app-private
+        // storage and survives across server restarts.
+        TokenStore.attach(applicationContext)
 
         wifiWatchJob?.cancel()
         wifiWatchJob = scope.launch {
@@ -299,6 +312,7 @@ class ServerService : Service() {
         queueWatchJob = null
         notifyWatchJob?.cancel()
         notifyWatchJob = null
+        ClipboardBridge.detach()
 
         // Drop the pending notification (queue won't be picked up after stop).
         NotificationManagerCompat.from(this).cancel(PENDING_NOTIF_ID)

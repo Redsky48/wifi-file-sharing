@@ -33,10 +33,13 @@ object ScreenCast {
         val longEdge: Int,
         val targetFps: Int,
         val jpegQuality: Int,
+        val isH264: Boolean = false,
+        val bitrateKbps: Int = 0,
     ) {
-        Quality("Quality", 1280, 18, 72),       // sharper text, slower fps
-        Balanced("Balanced", 1024, 24, 62),     // default — readable + responsive
-        Smooth("Smooth", 768, 32, 55),          // fps-first, softer image
+        Fast("Fast", 768, 18, 60),                                    // tiny CPU, low fps — for slow networks
+        Balanced("Balanced", 1024, 24, 62),                           // sweet spot for static UIs
+        Smooth("Smooth", 1280, 32, 0, isH264 = true, bitrateKbps = 4_000),   // H.264 hardware, screen-share default
+        Ultra("Ultra", 1280, 60, 0, isH264 = true, bitrateKbps = 8_000),     // gamers / animations
     }
 
     private val _state = MutableStateFlow(State.Stopped)
@@ -51,6 +54,43 @@ object ScreenCast {
     var measuredFps: Float = 0f
         private set
     internal fun setMeasuredFps(v: Float) { measuredFps = v }
+
+    // ── H.264 broadcast plumbing ────────────────────────────────────
+    // Active during H264 mode. Subscribers register their sink and get
+    // called once for the codec config (SPS+PPS) on subscribe, then for
+    // every access unit. CopyOnWriteArraySet so we can add/remove from
+    // any thread while the encoder drain loop iterates.
+
+    fun interface H264Sink {
+        fun onAccessUnit(data: ByteArray, isKeyframe: Boolean, ptsUs: Long)
+    }
+
+    private val sinks = java.util.concurrent.CopyOnWriteArraySet<H264Sink>()
+
+    @Volatile
+    var h264Config: ByteArray? = null     // SPS + PPS in annex-B
+        internal set
+    @Volatile
+    var h264Width: Int = 0
+        internal set
+    @Volatile
+    var h264Height: Int = 0
+        internal set
+
+    /** Latest IDR frame, replayed to newly-subscribed clients so they don't have to wait for the next keyframe. */
+    @Volatile
+    var lastKeyframe: ByteArray? = null
+        internal set
+
+    internal fun broadcastAccessUnit(data: ByteArray, isKeyframe: Boolean, ptsUs: Long) {
+        if (isKeyframe) lastKeyframe = data
+        for (s in sinks) {
+            runCatching { s.onAccessUnit(data, isKeyframe, ptsUs) }
+        }
+    }
+
+    fun registerSink(sink: H264Sink) { sinks.add(sink) }
+    fun unregisterSink(sink: H264Sink) { sinks.remove(sink) }
 
     @Volatile
     private var _latestJpeg: ByteArray? = null

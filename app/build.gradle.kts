@@ -12,8 +12,8 @@ android {
         applicationId = "com.wifishare"
         minSdk = 26
         targetSdk = 34
-        versionCode = 10
-        versionName = "0.10.0"
+        versionCode = 14
+        versionName = "0.14.0"
         resourceConfigurations += listOf("en")
 
         // ---- AdMob configuration ----
@@ -112,6 +112,7 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
+    implementation("com.google.zxing:core:3.5.3")
 
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("org.nanohttpd:nanohttpd-websocket:2.3.1")

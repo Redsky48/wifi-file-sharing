@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Accessibility-service config for RemoteInputService.
+
+  We claim canPerformGestures + flagDefault for tap/swipe/scroll
+  injection. accessibilityEventTypes is empty because we don't observe
+  events — pure output. Description shows up in the system enable
+  prompt.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes=""
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/remote_input_a11y_description"
+    android:notificationTimeout="0"
+    android:settingsActivity="com.wifishare.MainActivity"
+    android:summary="@string/remote_input_a11y_summary" />

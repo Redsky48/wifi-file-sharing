@@ -39,12 +39,12 @@ public sealed class QueuePoller : IDisposable
         _settings = settings;
     }
 
-    public void Start(string baseUrl, string? password)
+    public void Start(string baseUrl, string? password, string? bearerToken = null)
     {
         Stop();
         _baseUrl = baseUrl.TrimEnd('/');
         _http.Dispose();
-        _http = AuthHttp.Build(new Uri(_baseUrl), password, TimeSpan.FromSeconds(30));
+        _http = AuthHttp.Build(new Uri(_baseUrl), password, TimeSpan.FromSeconds(30), bearerToken);
         _cts = new CancellationTokenSource();
         _ = Task.Run(() => Loop(_cts.Token));
     }
